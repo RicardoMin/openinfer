@@ -27,7 +27,7 @@ pub(super) fn truncate_after_terminal(
     model_eos: &[u32],
 ) {
     // Keep this helper idempotent: the worker trims before DFlash context is
-    // recorded, and the executor repeats the invariant before KV commit.
+    // recorded, and the executor later asserts the same invariant at commit.
     let Some(keep) = result.accepted_tokens.iter().position(|&token| {
         policy
             .classify(token, |id| model_eos.contains(&id))
@@ -110,7 +110,7 @@ impl Qwen3Executor {
                 return Err(e);
             }
         };
-        let mut result = match outcome {
+        let result = match outcome {
             WorkerStepOutcome::SpeculativeVerify(result) => result,
             other => {
                 self.revert_speculative_schedules(&scheduled);
@@ -138,12 +138,35 @@ impl Qwen3Executor {
                 ));
             }
         }
-        // The worker normally applies the request contract before copying
-        // worker-side state. Recheck the same invariant here before touching
-        // RequestKv so a terminal suffix is rolled back with its reservation,
-        // including legacy workers that return an untrimmed span.
-        for (req, req_result) in plan.requests.iter().zip(&mut result.requests) {
-            truncate_after_terminal(req_result, &req.stop_policy, &self.metadata.stop_token_ids);
+        // The worker must have normalized each span before recording DFlash
+        // context (both the hedged and plain verify paths truncate at the first
+        // terminal token). Re-assert that invariant at commit: a broken worker
+        // fails loudly here instead of being silently truncated a second time.
+        for (req, req_result) in plan.requests.iter().zip(&result.requests) {
+            let terminal = |token: u32| {
+                req.stop_policy
+                    .classify(token, |id| self.metadata.stop_token_ids.contains(&id))
+                    .is_some()
+            };
+            let terminal_position = req_result
+                .accepted_tokens
+                .iter()
+                .position(|&token| terminal(token));
+            if let Some(position) = terminal_position
+                && position + 1 != req_result.accepted_tokens.len()
+            {
+                // Nothing has committed yet: roll back every reservation before
+                // surfacing the worker defect, mirroring the request-mismatch
+                // failures above.
+                self.revert_speculative_schedules(&scheduled);
+                return Err(anyhow::anyhow!(
+                    "speculative worker returned an untruncated span for {:?}: \
+                     terminal token at position {} of {}",
+                    req_result.request_id,
+                    position,
+                    req_result.accepted_tokens.len()
+                ));
+            }
         }
 
         // Commit the accepted prefix of each request's KV and free the rest.

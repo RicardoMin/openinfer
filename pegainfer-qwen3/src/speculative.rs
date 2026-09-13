@@ -77,9 +77,11 @@ pub(crate) struct VerifyRequestResult {
     /// Tokens to commit: the accepted draft prefix followed by the target's
     /// posterior token at the first mismatch (or the block-end continuation
     /// when every draft is accepted). Always `1..=K + 1` tokens, so a verify
-    /// step always makes at least one token of progress. Before KV commit the
-    /// executor truncates this span after the first request-terminal token;
-    /// the scheduler retains ownership of typed stop-cause emission.
+    /// step always makes at least one token of progress. The worker normalizes
+    /// this span after the first request-terminal token before DFlash context is
+    /// recorded; the executor asserts that invariant at commit rather than
+    /// re-truncating. The scheduler retains ownership of typed stop-cause
+    /// emission.
     pub accepted_tokens: Vec<u32>,
 }
 

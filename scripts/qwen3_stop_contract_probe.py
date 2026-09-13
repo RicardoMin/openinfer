@@ -14,6 +14,10 @@ Every check validates the wire shape, not merely the presence of a field:
 - under a full-vocabulary stop set the first token always matches, so the
   explicit-stop runs must report exactly one completion token;
 - the triggering token must carry a non-null numeric logprob;
+- the exact trigger is verified by requesting `return_token_ids` and comparing
+  the final returned token ID against `stop_reason`;
+- when `--qwen3-eos-token-id` / `--qwen35-eos-token-id` is given, an EOS
+  finish must end on exactly that trigger ID;
 - the streaming case must terminate with `[DONE]` and must not emit content
   after the finish event;
 - `/v1/models` must actually serve the requested model name.
@@ -111,22 +115,33 @@ def is_finite_number(value: Any) -> bool:
     return math.isfinite(value)
 
 
-def last_token_logprob(choice: dict[str, Any]) -> float | None:
-    """Logprob of the last token in one choice, or None when absent.
+def token_ids_from_choice(choice: dict[str, Any]) -> list[int] | None:
+    ids = choice.get("token_ids")
+    if isinstance(ids, list) and all(is_int(item) for item in ids):
+        return ids
+    return None
 
-    Accepts both the legacy ``{"tokens": [...], "token_logprobs": [...]}``
-    shape and the OpenAI content shape ``{"content": [{"logprob": ...}]}``. A
-    null entry is not a logprob and must fail the trigger check.
+
+def logprob_at_last(choice: dict[str, Any], token_count: int) -> float | None:
+    """Finite logprob of the final emitted token, or None when absent.
+
+    The logprob table must cover exactly the emitted tokens: a table shorter
+    than the token sequence (a missing trigger entry) or a null final entry is
+    a failure rather than an inherited value from an earlier token.
     """
     logprobs = choice.get("logprobs")
-    if not isinstance(logprobs, dict):
+    if not isinstance(logprobs, dict) or token_count == 0:
         return None
     token_logprobs = logprobs.get("token_logprobs")
-    if isinstance(token_logprobs, list) and token_logprobs:
+    if isinstance(token_logprobs, list):
+        if len(token_logprobs) != token_count:
+            return None
         value = token_logprobs[-1]
         return value if is_finite_number(value) else None
     content = logprobs.get("content")
-    if isinstance(content, list) and content:
+    if isinstance(content, list):
+        if len(content) != token_count:
+            return None
         last = content[-1]
         if isinstance(last, dict):
             value = last.get("logprob")
@@ -135,7 +150,10 @@ def last_token_logprob(choice: dict[str, Any]) -> float | None:
 
 
 def stream_token_count(choice: dict[str, Any]) -> int:
-    """Number of tokens a streaming choice emits (via logprobs or bare text)."""
+    """Number of tokens a streaming choice emits (token_ids, logprobs, or text)."""
+    ids = token_ids_from_choice(choice)
+    if ids is not None:
+        return len(ids)
     logprobs = choice.get("logprobs")
     if isinstance(logprobs, dict):
         tokens = logprobs.get("tokens")
@@ -163,18 +181,21 @@ def completion_summary(response: dict[str, Any]) -> dict[str, Any]:
             "finish_reason": None,
             "stop_reason": None,
             "completion_tokens": None,
+            "token_ids": None,
             "trigger_logprob": None,
         }
     choice = first_choice(body)
     usage = body.get("usage") if isinstance(body.get("usage"), dict) else {}
     stop_reason = choice.get("stop_reason", body.get("stop_reason"))
+    token_ids = token_ids_from_choice(choice)
     return {
         "http_status": response.get("http_status"),
         "elapsed_ms": response.get("elapsed_ms"),
         "finish_reason": choice.get("finish_reason"),
         "stop_reason": stop_reason,
         "completion_tokens": usage.get("completion_tokens"),
-        "trigger_logprob": last_token_logprob(choice),
+        "token_ids": token_ids,
+        "trigger_logprob": logprob_at_last(choice, len(token_ids) if token_ids is not None else 0),
     }
 
 
@@ -194,6 +215,7 @@ def completion_payload(
         "max_tokens": max_tokens,
         "ignore_eos": ignore_eos,
         "stream": stream,
+        "return_token_ids": True,
     }
     if stop_token_ids is not None:
         payload["stop_token_ids"] = stop_token_ids
@@ -239,7 +261,9 @@ def request_stream(
     started = time.perf_counter()
     events = 0
     emitted_tokens = 0
-    last_stream_logprob = None
+    stream_token_ids: list[int] = []
+    last_content_logprob: float | None = None
+    trigger_logprob_valid = False
     finish_reason: Any = None
     stop_reason: Any = None
     done_seen = False
@@ -276,7 +300,8 @@ def request_stream(
                     continue
                 choice = choices[0] if isinstance(choices[0], dict) else {}
                 text = choice.get("text")
-                token_count = stream_token_count(choice)
+                frame_ids = token_ids_from_choice(choice)
+                token_count = len(frame_ids) if frame_ids is not None else stream_token_count(choice)
                 has_content = bool(text) or token_count > 0
                 this_finish = choice.get("finish_reason")
                 this_stop = chunk.get("stop_reason", choice.get("stop_reason"))
@@ -285,19 +310,23 @@ def request_stream(
                     if has_content or terminal_event:
                         content_after_finish = True
                     continue
+                if has_content:
+                    # Count content even when it shares a frame with the finish
+                    # metadata; a terminal frame must not hide emitted tokens.
+                    events += 1
+                    emitted_tokens += token_count if token_count else 1
+                    if frame_ids is not None:
+                        stream_token_ids.extend(frame_ids)
+                    value = logprob_at_last(choice, token_count)
+                    trigger_logprob_valid = value is not None
+                    if value is not None:
+                        last_content_logprob = value
                 if terminal_event:
                     if this_finish is not None:
                         finish_reason = this_finish
                     if stop_reason is None and this_stop is not None:
                         stop_reason = this_stop
                     finished = True
-                    continue
-                if has_content:
-                    events += 1
-                    emitted_tokens += token_count if token_count else 1
-                    value = last_token_logprob(choice)
-                    if value is not None:
-                        last_stream_logprob = value
     except HTTPError as exc:
         status = exc.code
         error = exc.read().decode("utf-8", errors="replace")
@@ -308,7 +337,8 @@ def request_stream(
         "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
         "stream_events": events,
         "emitted_tokens": emitted_tokens,
-        "trigger_logprob": last_stream_logprob,
+        "token_ids": stream_token_ids,
+        "trigger_logprob": last_content_logprob if trigger_logprob_valid else None,
         "finish_reason": finish_reason,
         "stop_reason": stop_reason,
         "completion_tokens": None,
@@ -349,41 +379,64 @@ def is_stop_finish(result: dict[str, Any]) -> bool:
 
 
 def typed_stop(result: dict[str, Any], stop_ids: list[int], full_vocab: bool) -> bool:
-    """A typed request stop: integer stop_reason from the requested set."""
+    """A typed request stop: the reported stop_reason is the emitted trigger."""
     if not is_stop_finish(result):
         return False
     if not numeric_stop_reason(result) or result["stop_reason"] not in stop_ids:
         return False
+    ids = result.get("token_ids")
+    if not isinstance(ids, list) or not ids:
+        return False
     tokens = result.get("completion_tokens")
-    if not is_int(tokens) or tokens < 1:
+    if not is_int(tokens) or tokens != len(ids) or tokens < 1:
+        return False
+    if ids[-1] != result["stop_reason"]:
         return False
     if full_vocab:
         # The first sampled token is in the full-vocabulary stop set, so the
         # trigger must be the only completion token.
-        return tokens == 1
+        return len(ids) == 1
     return True
 
 
-def eos_or_typed_stop(result: dict[str, Any], stop_ids: list[int], full_vocab: bool) -> bool:
+def eos_or_typed_stop(
+    result: dict[str, Any],
+    stop_ids: list[int],
+    full_vocab: bool,
+    eos_id: int | None,
+) -> bool:
     """EOS-enabled explicit-stop case: a model EOS may win over the stop set."""
     if not is_stop_finish(result):
         return False
-    stop_reason = result.get("stop_reason")
-    if stop_reason is not None and (not is_int(stop_reason) or stop_reason not in stop_ids):
+    ids = result.get("token_ids")
+    if not isinstance(ids, list) or not ids:
         return False
     tokens = result.get("completion_tokens")
-    if not is_int(tokens) or tokens < 1:
+    if not is_int(tokens) or tokens != len(ids) or tokens < 1:
         return False
-    if full_vocab:
-        return tokens == 1
-    return True
+    stop_reason = result.get("stop_reason")
+    if stop_reason is None:
+        # A model EOS won. With a configured EOS ID the final token must be
+        # exactly that trigger; otherwise only the count and terminal shape
+        # are verifiable.
+        if eos_id is not None and ids[-1] != eos_id:
+            return False
+        return not full_vocab or len(ids) == 1
+    if not is_int(stop_reason) or stop_reason not in stop_ids:
+        return False
+    if ids[-1] != stop_reason:
+        return False
+    return not full_vocab or len(ids) == 1
 
 
 def length_control(result: dict[str, Any], max_tokens: int) -> bool:
+    ids = result.get("token_ids")
     return (
         result.get("http_status") == 200
         and result.get("finish_reason") == "length"
         and result.get("stop_reason") is None
+        and isinstance(ids, list)
+        and len(ids) == max_tokens
         and is_int(result.get("completion_tokens"))
         and result.get("completion_tokens") == max_tokens
     )
@@ -403,6 +456,7 @@ def run_target(
     model: str,
     vocab_size: int,
     args: argparse.Namespace,
+    eos_token_id: int | None = None,
 ) -> dict[str, Any]:
     stop_ids = build_stop_ids(vocab_size, args.stop_token_id)
     full_vocab = args.stop_token_id is None
@@ -466,7 +520,9 @@ def run_target(
         "model_present": bool(model_probe.get("expected_model_present")),
         "baseline_control": length_control(cases["control"], args.max_tokens),
         "explicit_stop_ignore_eos": typed_stop(cases["explicit_stop_ignore_eos"], stop_ids, full_vocab),
-        "explicit_stop_eos_enabled": eos_or_typed_stop(cases["explicit_stop_eos_enabled"], stop_ids, full_vocab),
+        "explicit_stop_eos_enabled": eos_or_typed_stop(
+            cases["explicit_stop_eos_enabled"], stop_ids, full_vocab, eos_token_id
+        ),
         "stop_set_order_invariant": (
             typed_stop(cases["stop_ascending"], stop_ids, full_vocab)
             and typed_stop(cases["stop_descending"], stop_ids, full_vocab)
@@ -489,13 +545,14 @@ def run_target(
             and not streaming.get("content_after_finish")
             and streaming.get("malformed_chunks", 0) == 0
             and is_finite_number(streaming.get("trigger_logprob"))
+            and isinstance(streaming.get("token_ids"), list)
+            and len(streaming["token_ids"]) > 0
+            and streaming["token_ids"][-1] == streaming.get("stop_reason")
+            and streaming.get("emitted_tokens") == len(streaming["token_ids"])
             and (
                 streaming.get("emitted_tokens") == 1
                 if full_vocab
-                else (
-                    isinstance(streaming.get("emitted_tokens"), int)
-                    and streaming.get("emitted_tokens") >= 1
-                )
+                else (is_int(streaming.get("emitted_tokens")) and streaming["emitted_tokens"] >= 1)
             )
         ),
         "mixed_controls_pass_3_of_3": sum(length_control(item, args.max_tokens) for item in mixed_controls) == 3,
@@ -562,6 +619,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--qwen35-url", default=DEFAULT_QWEN35_URL)
     parser.add_argument("--qwen35-model", default=DEFAULT_QWEN35_MODEL)
     parser.add_argument("--qwen35-vocab-size", type=int, default=DEFAULT_QWEN35_VOCAB)
+    parser.add_argument(
+        "--qwen3-eos-token-id",
+        type=int,
+        default=None,
+        help="Verify an EOS finish ends on exactly this token ID (optional)",
+    )
+    parser.add_argument(
+        "--qwen35-eos-token-id",
+        type=int,
+        default=None,
+        help="Verify an EOS finish ends on exactly this token ID (optional)",
+    )
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--max-tokens", type=int, default=8)
     parser.add_argument("--timeout", type=float, default=300.0)
@@ -593,6 +662,7 @@ def parse_args() -> argparse.Namespace:
 
 SELF_CHECK_MODEL = "qwen3-adapted"
 SELF_CHECK_STOP_ID = 12095
+SELF_CHECK_EOS_ID = 151645
 
 _MODE = "valid"
 _MODE_LOCK = threading.Lock()
@@ -650,11 +720,17 @@ class MockHandler(BaseHTTPRequestHandler):
         explicit = body.get("stop_token_ids") is not None
         max_tokens = body.get("max_tokens", 8)
         if not explicit:
+            control_choice: dict[str, Any] = {
+                "text": " word",
+                "index": 0,
+                "finish_reason": "length",
+                "logprobs": None,
+            }
+            if mode != "missing_token_ids":
+                control_choice["token_ids"] = list(range(max_tokens))
             self._json(
                 {
-                    "choices": [
-                        {"text": " word", "index": 0, "finish_reason": "length", "logprobs": None}
-                    ],
+                    "choices": [control_choice],
                     "usage": {
                         "prompt_tokens": 5,
                         "completion_tokens": max_tokens,
@@ -663,17 +739,50 @@ class MockHandler(BaseHTTPRequestHandler):
                 }
             )
             return
+        if mode == "eos_win" and not body.get("ignore_eos"):
+            self._json(
+                {
+                    "choices": [
+                        {
+                            "text": "",
+                            "index": 0,
+                            "finish_reason": "stop",
+                            "logprobs": None,
+                            "stop_reason": None,
+                            "token_ids": [SELF_CHECK_EOS_ID],
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 5,
+                        "completion_tokens": 1,
+                        "total_tokens": 6,
+                    },
+                }
+            )
+            return
         stop_reason: Any = SELF_CHECK_STOP_ID if mode != "string_stop_reason" else "oops"
         tokens = max_tokens if mode == "extra_tokens" else 1
+        token_ids = list(range(tokens)) if mode == "extra_tokens" else [SELF_CHECK_STOP_ID]
+        if mode == "missing_trigger_logprob":
+            tokens = 2
+            token_ids = [999, SELF_CHECK_STOP_ID]
+        if mode == "wrong_trigger_id":
+            stop_reason = 17
+            token_ids = [SELF_CHECK_STOP_ID]
         choice: dict[str, Any] = {
             "text": " stop",
             "index": 0,
             "finish_reason": "stop",
             "logprobs": None,
         }
+        if mode != "missing_token_ids":
+            choice["token_ids"] = token_ids
         if (body.get("logprobs") or 0) > 0:
             if mode == "null_logprobs":
                 choice["logprobs"] = {"content": [{"token": "<trigger>", "logprob": None}]}
+            elif mode == "missing_trigger_logprob":
+                # One logprob entry short of the two emitted tokens.
+                choice["logprobs"] = {"tokens": ["<prev>"], "token_logprobs": [-0.5]}
             else:
                 choice["logprobs"] = {"content": [{"token": "<trigger>", "logprob": -0.53125}]}
         choice["stop_reason"] = stop_reason
@@ -698,30 +807,45 @@ class MockHandler(BaseHTTPRequestHandler):
         def emit(chunk: dict[str, Any]) -> None:
             self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
 
-        emit(
-            {
-                "id": "cmpl-1",
-                "choices": [
-                    {
-                        "text": "",
-                        "index": 0,
-                        "finish_reason": None,
-                        "logprobs": {
-                            "tokens": [" stop"],
-                            "token_logprobs": [-0.53125],
-                            "top_logprobs": [],
-                        },
-                    }
-                ],
+        first_choice: dict[str, Any] = {
+            "text": "",
+            "index": 0,
+            "finish_reason": None,
+            "token_ids": [SELF_CHECK_STOP_ID],
+        }
+        if mode != "stream_missing_trigger_logprob":
+            first_choice["logprobs"] = {
+                "tokens": [" stop"],
+                "token_logprobs": [-0.53125],
+                "top_logprobs": [],
             }
-        )
-        emit(
-            {
-                "id": "cmpl-1",
-                "choices": [{"text": "", "index": 0, "finish_reason": "stop", "logprobs": None}],
-                "stop_reason": stop_reason,
-            }
-        )
+        emit({"id": "cmpl-1", "choices": [first_choice]})
+        if mode in ("terminal_frame_extra_token", "terminal_frame_extra_token_full_vocab"):
+            # The finish frame smuggles a second token next to the metadata.
+            smuggled = [17] if mode == "terminal_frame_extra_token" else [SELF_CHECK_STOP_ID]
+            emit(
+                {
+                    "id": "cmpl-1",
+                    "choices": [
+                        {
+                            "text": "",
+                            "index": 0,
+                            "finish_reason": "stop",
+                            "logprobs": None,
+                            "token_ids": smuggled,
+                        }
+                    ],
+                    "stop_reason": stop_reason,
+                }
+            )
+        else:
+            emit(
+                {
+                    "id": "cmpl-1",
+                    "choices": [{"text": "", "index": 0, "finish_reason": "stop", "logprobs": None}],
+                    "stop_reason": stop_reason,
+                }
+            )
         if mode == "stream_tail":
             emit(
                 {
@@ -736,11 +860,13 @@ class MockHandler(BaseHTTPRequestHandler):
                                 "token_logprobs": [-1.0],
                                 "top_logprobs": [],
                             },
+                            "token_ids": [17],
                         }
                     ],
                 }
             )
-        self.wfile.write(b"data: [DONE]\n\n")
+        if mode != "stream_missing_done":
+            self.wfile.write(b"data: [DONE]\n\n")
 
 
 def run_self_check() -> int:
@@ -757,24 +883,81 @@ def run_self_check() -> int:
         stop_token_id = None
 
     cases = [
-        ("valid", None, True, "valid service passes every check"),
-        ("string_stop_reason", SELF_CHECK_STOP_ID, False, "string stop_reason must be rejected"),
-        ("null_logprobs", SELF_CHECK_STOP_ID, False, "null trigger logprob must be rejected"),
-        ("stream_tail", SELF_CHECK_STOP_ID, False, "content after the finish event must be rejected"),
-        ("wrong_model", SELF_CHECK_STOP_ID, False, "model-name mismatch must be rejected"),
+        ("valid", None, None, True, "valid service passes every check"),
+        (
+            "eos_win",
+            SELF_CHECK_STOP_ID,
+            SELF_CHECK_EOS_ID,
+            True,
+            "an EOS finish must end on the configured EOS trigger",
+        ),
+        ("string_stop_reason", SELF_CHECK_STOP_ID, None, False, "string stop_reason must be rejected"),
+        ("null_logprobs", SELF_CHECK_STOP_ID, None, False, "null trigger logprob must be rejected"),
+        ("stream_tail", SELF_CHECK_STOP_ID, None, False, "content after the finish event must be rejected"),
+        ("wrong_model", SELF_CHECK_STOP_ID, None, False, "model-name mismatch must be rejected"),
         (
             "extra_tokens",
+            None,
             None,
             False,
             "extra completion tokens under a full-vocabulary stop set must be rejected",
         ),
+        (
+            "missing_trigger_logprob",
+            SELF_CHECK_STOP_ID,
+            None,
+            False,
+            "a missing final logprob must not inherit the previous token's value",
+        ),
+        (
+            "wrong_trigger_id",
+            None,
+            None,
+            False,
+            "stop_reason must match the actual final token ID",
+        ),
+        (
+            "terminal_frame_extra_token",
+            SELF_CHECK_STOP_ID,
+            None,
+            False,
+            "tokens sharing a frame with finish metadata must be counted",
+        ),
+        (
+            "terminal_frame_extra_token_full_vocab",
+            None,
+            None,
+            False,
+            "a duplicated trigger in the finish frame must still be counted",
+        ),
+        (
+            "missing_token_ids",
+            None,
+            None,
+            False,
+            "responses without token IDs cannot satisfy the trigger checks",
+        ),
+        (
+            "stream_missing_done",
+            SELF_CHECK_STOP_ID,
+            None,
+            False,
+            "a stream that never sends [DONE] must be rejected",
+        ),
+        (
+            "stream_missing_trigger_logprob",
+            SELF_CHECK_STOP_ID,
+            None,
+            False,
+            "the trigger frame must carry its own finite logprob",
+        ),
     ]
     failures = 0
-    for mode, stop_id, expect_pass, label in cases:
+    for mode, stop_id, eos_id, expect_pass, label in cases:
         set_mock_mode(mode)
         args = Args()
         args.stop_token_id = stop_id
-        target = run_target("qwen3_adapted", base_url, SELF_CHECK_MODEL, DEFAULT_QWEN3_VOCAB, args)
+        target = run_target("qwen3_adapted", base_url, SELF_CHECK_MODEL, DEFAULT_QWEN3_VOCAB, args, eos_id)
         passed = target["new_contract_passed"]
         ok = passed == expect_pass
         if not ok:
@@ -805,6 +988,7 @@ def main() -> int:
             args.qwen3_model,
             args.qwen3_vocab_size,
             args,
+            args.qwen3_eos_token_id,
         )
         qwen35 = run_target(
             "qwen35_legacy",
@@ -812,6 +996,7 @@ def main() -> int:
             args.qwen35_model,
             args.qwen35_vocab_size,
             args,
+            args.qwen35_eos_token_id,
         )
     except ValueError as error:
         print(str(error), file=sys.stderr)
@@ -831,6 +1016,8 @@ def main() -> int:
             "max_tokens": args.max_tokens,
             "stop_mode": "single" if args.stop_token_id is not None else "full-vocabulary",
             "stop_token_id": args.stop_token_id,
+            "qwen3_eos_token_id": args.qwen3_eos_token_id,
+            "qwen35_eos_token_id": args.qwen35_eos_token_id,
         },
         "targets": {"qwen3_adapted": qwen3, "qwen35_legacy": qwen35},
         "comparison": comparison,

@@ -629,7 +629,8 @@ fn dflash_concurrent_heterogeneous_is_lossless() {
 /// Production hedge regression: an explicit stop in the middle of a verify
 /// span must be applied before the hedge winner is selected and committed.
 /// The parent gate also checks the request-local worker trace, because the
-/// final stream alone is protected by the executor's legacy safety truncation.
+/// final stream alone cannot prove the winner was selected from a truncated
+/// span (a broken worker is only rejected at commit, after the fact).
 #[test]
 fn dflash_hedged_midspan_stop_retains_trigger() {
     common::harness::init_capture_logging();
