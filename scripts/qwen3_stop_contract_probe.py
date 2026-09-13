@@ -334,8 +334,14 @@ def probe_models(base_url: str, timeout: float, expected_model: str) -> dict[str
     return result
 
 
+def is_int(value: Any) -> bool:
+    # JSON `true` parses to Python True, which is also an `int` subclass;
+    # exclude it so a boolean wire value can never satisfy a numeric check.
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def numeric_stop_reason(result: dict[str, Any]) -> bool:
-    return isinstance(result.get("stop_reason"), int)
+    return is_int(result.get("stop_reason"))
 
 
 def is_stop_finish(result: dict[str, Any]) -> bool:
@@ -349,7 +355,7 @@ def typed_stop(result: dict[str, Any], stop_ids: list[int], full_vocab: bool) ->
     if not numeric_stop_reason(result) or result["stop_reason"] not in stop_ids:
         return False
     tokens = result.get("completion_tokens")
-    if not isinstance(tokens, int) or tokens < 1:
+    if not is_int(tokens) or tokens < 1:
         return False
     if full_vocab:
         # The first sampled token is in the full-vocabulary stop set, so the
@@ -363,12 +369,10 @@ def eos_or_typed_stop(result: dict[str, Any], stop_ids: list[int], full_vocab: b
     if not is_stop_finish(result):
         return False
     stop_reason = result.get("stop_reason")
-    if stop_reason is not None and (
-        not isinstance(stop_reason, int) or stop_reason not in stop_ids
-    ):
+    if stop_reason is not None and (not is_int(stop_reason) or stop_reason not in stop_ids):
         return False
     tokens = result.get("completion_tokens")
-    if not isinstance(tokens, int) or tokens < 1:
+    if not is_int(tokens) or tokens < 1:
         return False
     if full_vocab:
         return tokens == 1
@@ -380,6 +384,7 @@ def length_control(result: dict[str, Any], max_tokens: int) -> bool:
         result.get("http_status") == 200
         and result.get("finish_reason") == "length"
         and result.get("stop_reason") is None
+        and is_int(result.get("completion_tokens"))
         and result.get("completion_tokens") == max_tokens
     )
 
