@@ -19,7 +19,6 @@ use pegainfer_core::weight_loader::load_shard_info;
 use pegainfer_frontend::engine::DeferredFinish;
 use pegainfer_frontend::engine::LoadLoraAdapterRequest;
 use pegainfer_frontend::engine::SpecDecodeCounters;
-use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::engine::UnloadLoraAdapterRequest;
 use pegainfer_frontend::engine::panic_message;
@@ -495,7 +494,6 @@ fn execute_step_on_lane(
         StepCommand::SpeculativeVerify {
             requests,
             kv_views,
-            stop_policies,
             sample_seed,
             verify_round,
         } => {
@@ -505,13 +503,8 @@ fn execute_step_on_lane(
             // token at each span position) and captures the target hidden states
             // (at the DFlash layers) to seed the next draft — all into reused,
             // pointer-stable scratch (`VerifyGraphBuffers`).
-            let result = lane.execute_dflash_verify(
-                requests,
-                kv_views,
-                stop_policies,
-                *sample_seed,
-                *verify_round,
-            )?;
+            let result =
+                lane.execute_dflash_verify(requests, kv_views, *sample_seed, *verify_round)?;
             Ok(WorkerStepOutcome::SpeculativeVerify(result))
         }
         StepCommand::SpeculativeDraft { requests } => Ok(WorkerStepOutcome::SpeculativeDraft(
@@ -3438,7 +3431,6 @@ impl LocalQwen3Lane {
         &mut self,
         requests: &[VerifyStepItem],
         kv_views: &[KvView],
-        stop_policies: &[StopPolicy],
         capture_layer_ids: &[usize],
         sample_seed: u64,
         verify_round: u64,
@@ -3519,7 +3511,12 @@ impl LocalQwen3Lane {
                         replaced.push((orig, scratch_page));
                     }
                     next_scratch += span_pages;
-                    expanded.push(VerifyStepItem::new(req.request_id, ids.clone(), req.params));
+                    expanded.push(VerifyStepItem::new(
+                        req.request_id,
+                        ids.clone(),
+                        req.params,
+                        req.stop_policy.clone(),
+                    ));
                     views.push(KvView::new(pages, v.seq_len(), page_size));
                     hedge_spans.push((idx, replaced));
                     added.push(ids);
@@ -3576,13 +3573,17 @@ impl LocalQwen3Lane {
         } else {
             Vec::new()
         };
-        for (result, policy) in results_a.iter_mut().zip(stop_policies) {
-            spec::truncate_after_terminal(result, policy, &self.model.config().stop_token_ids);
+        for (result, req) in results_a.iter_mut().zip(requests) {
+            spec::truncate_after_terminal(
+                result,
+                &req.stop_policy,
+                &self.model.config().stop_token_ids,
+            );
         }
         for (slot, (idx, _)) in hedge_spans.iter().enumerate() {
             spec::truncate_after_terminal(
                 &mut results_b[slot],
-                &stop_policies[*idx],
+                &requests[*idx].stop_policy,
                 &self.model.config().stop_token_ids,
             );
         }
@@ -3697,16 +3698,9 @@ impl LocalQwen3Lane {
         &mut self,
         requests: &[VerifyStepItem],
         kv_views: &[KvView],
-        stop_policies: &[StopPolicy],
         sample_seed: u64,
         verify_round: u64,
     ) -> Result<VerifyResult> {
-        anyhow::ensure!(
-            stop_policies.len() == requests.len(),
-            "DFlash verify received {} stop policies for {} requests",
-            stop_policies.len(),
-            requests.len()
-        );
         let capture_layer_ids = self.dflash_capture_layer_ids().ok_or_else(|| {
             anyhow::anyhow!("DFlash verify requested but no draft model is loaded")
         })?;
@@ -3756,7 +3750,6 @@ impl LocalQwen3Lane {
                 if let Some(result) = self.try_execute_hedged_verify(
                     requests,
                     kv_views,
-                    stop_policies,
                     &capture_layer_ids,
                     sample_seed,
                     verify_round,
@@ -3797,8 +3790,12 @@ impl LocalQwen3Lane {
             // Apply the request policy before recording target hidden states;
             // otherwise a suffix discarded by terminal handling would leak
             // into the next DFlash draft context and acceptance counters.
-            for (policy, result) in stop_policies.iter().zip(&mut request_results) {
-                spec::truncate_after_terminal(result, policy, &self.model.config().stop_token_ids);
+            for (req, result) in requests.iter().zip(&mut request_results) {
+                spec::truncate_after_terminal(
+                    result,
+                    &req.stop_policy,
+                    &self.model.config().stop_token_ids,
+                );
             }
             self.record_verify_dflash_context(
                 requests,
@@ -3912,9 +3909,6 @@ enum StepCommand {
     SpeculativeVerify {
         requests: Vec<VerifyStepItem>,
         kv_views: Vec<KvView>,
-        /// Request-local stop policies used before DFlash context recording;
-        /// these are host metadata and never enter the GPU batch.
-        stop_policies: Vec<StopPolicy>,
         sample_seed: u64,
         verify_round: u64,
     },

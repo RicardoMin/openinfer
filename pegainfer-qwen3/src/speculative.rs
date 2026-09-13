@@ -38,14 +38,21 @@ pub(crate) struct VerifyStepItem {
     pub(crate) request_id: RequestId,
     pub(crate) token_ids: Vec<u32>,
     pub(crate) params: SamplingParams,
+    pub(crate) stop_policy: StopPolicy,
 }
 
 impl VerifyStepItem {
-    pub(crate) fn new(request_id: RequestId, token_ids: Vec<u32>, params: SamplingParams) -> Self {
+    pub(crate) fn new(
+        request_id: RequestId,
+        token_ids: Vec<u32>,
+        params: SamplingParams,
+        stop_policy: StopPolicy,
+    ) -> Self {
         Self {
             request_id,
             token_ids,
             params,
+            stop_policy,
         }
     }
 
@@ -57,9 +64,6 @@ impl VerifyStepItem {
 #[derive(Clone, Copy)]
 pub(crate) struct VerifyPlan<'a> {
     pub requests: &'a [VerifyStepItem],
-    /// Request-local stop policies in the same order as `requests`. They remain
-    /// host-side and are not copied into GPU buffers.
-    pub stop_policies: &'a [StopPolicy],
     /// Engine step seed for the verify rows' sampler pass (same contract as
     /// decode: fresh per step; seeded rows re-mix their own request seed).
     pub sample_seed: u64,
@@ -262,6 +266,7 @@ mod tests {
             RequestId::new(7),
             vec![10, 11, 12, 13],
             SamplingParams::default(),
+            StopPolicy::default(),
         );
         let results = build_verify_results(&[req], &[11, 12, 99, 100]).expect("verify results");
         assert_eq!(results.len(), 1);
@@ -276,6 +281,7 @@ mod tests {
             RequestId::new(8),
             vec![20, 21, 22],
             SamplingParams::default(),
+            StopPolicy::default(),
         );
         let results = build_verify_results(&[req], &[21, 22, 23]).expect("verify results");
         assert_eq!(results[0].matched_draft_tokens, 2);
@@ -284,8 +290,18 @@ mod tests {
 
     #[test]
     fn batched_multi_request_splits_columns_by_span() {
-        let a = VerifyStepItem::new(RequestId::new(1), vec![5, 6], SamplingParams::default());
-        let b = VerifyStepItem::new(RequestId::new(2), vec![7, 8, 9], SamplingParams::default());
+        let a = VerifyStepItem::new(
+            RequestId::new(1),
+            vec![5, 6],
+            SamplingParams::default(),
+            StopPolicy::default(),
+        );
+        let b = VerifyStepItem::new(
+            RequestId::new(2),
+            vec![7, 8, 9],
+            SamplingParams::default(),
+            StopPolicy::default(),
+        );
         // a: posterior [6, 100] -> accept draft 6, bonus 100. b: posterior [8, 77, 0]
         // -> accept draft 8, correction 77.
         let results = build_verify_results(&[a, b], &[6, 100, 8, 77, 0]).expect("verify results");

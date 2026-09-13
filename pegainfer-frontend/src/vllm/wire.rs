@@ -266,30 +266,29 @@ mod tests {
     }
 
     #[test]
-    fn convert_stop_policy_keeps_eos_and_explicit_stops_independent() {
+    fn convert_stop_policy_keeps_primary_and_secondary_eos_distinct() {
         let mut params = EngineCoreSamplingParams::for_test();
         params.eos_token_id = Some(99);
-        params.stop_token_ids = vec![11, 100];
+        params.stop_token_ids = vec![100];
 
         let policy = convert_stop_policy(&params);
+        // The primary protocol EOS is carried as `EosPolicy::Token`, so it is
+        // still an EOS stop even when the model predicate is unavailable.
         assert_eq!(
-            policy.classify(99, |token_id| token_id == 99),
+            policy.classify(99, |_| false),
             Some(crate::engine::StopCause::Eos(99))
         );
-        assert_eq!(
-            policy.classify(11, |_| false),
-            Some(crate::engine::StopCause::Token(11))
-        );
+        // Secondary model EOS IDs must keep their token stop reason.
         assert_eq!(
             policy.classify(100, |_| true),
-            Some(crate::engine::StopCause::Token(100)),
-            "secondary EOS IDs must retain a token stop reason"
+            Some(crate::engine::StopCause::Token(100))
         );
 
         params.eos_token_id = None;
         params.stop_token_ids = vec![99];
         params.all_stop_token_ids = BTreeSet::from([99, 100]);
         let policy = convert_stop_policy(&params);
+        // EOS disabled: the primary ID stops only when explicitly requested.
         assert_eq!(
             policy.classify(99, |_| true),
             Some(crate::engine::StopCause::Token(99))

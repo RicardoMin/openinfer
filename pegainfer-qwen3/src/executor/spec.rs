@@ -54,12 +54,6 @@ impl Qwen3Executor {
             self.speculative.is_some(),
             "speculative verification requested but no draft model is loaded"
         );
-        anyhow::ensure!(
-            plan.stop_policies.len() == plan.requests.len(),
-            "speculative verify received {} stop policies for {} requests",
-            plan.stop_policies.len(),
-            plan.requests.len()
-        );
         for req in plan.requests {
             anyhow::ensure!(
                 !req.as_slice().is_empty(),
@@ -106,7 +100,6 @@ impl Qwen3Executor {
         let step = StepCommand::SpeculativeVerify {
             requests: plan.requests.to_vec(),
             kv_views,
-            stop_policies: plan.stop_policies.to_vec(),
             sample_seed: plan.sample_seed,
             verify_round,
         };
@@ -149,8 +142,8 @@ impl Qwen3Executor {
         // worker-side state. Recheck the same invariant here before touching
         // RequestKv so a terminal suffix is rolled back with its reservation,
         // including legacy workers that return an untrimmed span.
-        for (policy, req_result) in plan.stop_policies.iter().zip(&mut result.requests) {
-            truncate_after_terminal(req_result, policy, &self.metadata.stop_token_ids);
+        for (req, req_result) in plan.requests.iter().zip(&mut result.requests) {
+            truncate_after_terminal(req_result, &req.stop_policy, &self.metadata.stop_token_ids);
         }
 
         // Commit the accepted prefix of each request's KV and free the rest.

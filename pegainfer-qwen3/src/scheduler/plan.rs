@@ -118,11 +118,9 @@ pub(crate) fn execute_plan(
                 requests: &draft_requests,
             })?;
             draft.requests.sort_by_key(|result| result.request_id);
-            let (verify_requests, stop_policies) =
-                build_speculative_verify_items(active, &draft.requests);
+            let verify_requests = build_speculative_verify_items(active, &draft.requests);
             let mut verify = executor.execute_speculative_verify(VerifyPlan {
                 requests: &verify_requests,
-                stop_policies: &stop_policies,
                 sample_seed: rand::RngExt::random(rng),
             })?;
             verify.requests.sort_by_key(|result| result.request_id);
@@ -184,12 +182,8 @@ fn build_speculative_draft_items(active: &[ActiveRequestState]) -> Vec<DraftStep
 fn build_speculative_verify_items(
     active: &[ActiveRequestState],
     draft_results: &[DraftRequestResult],
-) -> (
-    Vec<VerifyStepItem>,
-    Vec<pegainfer_frontend::engine::StopPolicy>,
-) {
+) -> Vec<VerifyStepItem> {
     let mut requests = Vec::with_capacity(draft_results.len());
-    let mut stop_policies = Vec::with_capacity(draft_results.len());
     for draft in draft_results {
         let active = active
             .iter()
@@ -209,10 +203,10 @@ fn build_speculative_verify_items(
             draft.request_id,
             token_ids,
             active.params,
+            active.stop_policy.clone(),
         ));
-        stop_policies.push(active.stop_policy.clone());
     }
-    (requests, stop_policies)
+    requests
 }
 
 fn build_prefill_items(pending: &[PendingRequest], indices: &[usize]) -> Vec<PrefillStepItem> {
@@ -320,13 +314,13 @@ mod tests {
             token_ids: (0..16).collect(),
         };
 
-        let (verify, stop_policies) = build_speculative_verify_items(&active, &[draft]);
+        let verify = build_speculative_verify_items(&active, &[draft]);
 
         assert_eq!(verify.len(), 1);
         // 32 - 24 = 8 remaining → the 16-token span truncates to 8.
         assert_eq!(verify[0].as_slice().len(), 8);
         assert_eq!(verify[0].as_slice(), (0..8).collect::<Vec<_>>());
-        assert_eq!(stop_policies, vec![StopPolicy::default()]);
+        assert_eq!(verify[0].stop_policy, StopPolicy::default());
     }
 
     // The plan selector is the whole batch-formation policy: what the scheduler

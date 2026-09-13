@@ -79,14 +79,8 @@ impl StepCollector {
     /// Fold this request's stream to its end: all tokens in order plus the
     /// terminal. Panics if the stream closes without a terminal.
     fn collect_terminal(&mut self, id: RequestId) -> (Vec<u32>, Terminal) {
-        let mut tokens = Vec::new();
-        loop {
-            let update = self.next_for(id);
-            tokens.extend_from_slice(&update.tokens);
-            if let Some(terminal) = update.terminal {
-                return (tokens, terminal);
-            }
-        }
+        let (tokens, _, terminal) = self.collect_terminal_with_logprobs(id);
+        (tokens, terminal)
     }
 
     fn collect_terminal_with_logprobs(

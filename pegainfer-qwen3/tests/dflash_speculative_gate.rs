@@ -692,6 +692,7 @@ fn dflash_hedged_midspan_stop_retains_trigger() {
     );
 
     let mut stopped_cases = 0usize;
+    let mut no_stop_cases = 0usize;
     for (baseline_index, stop_id) in candidate_stops {
         let stopped_params = SamplingParams {
             ignore_eos: true,
@@ -704,29 +705,49 @@ fn dflash_hedged_midspan_stop_retains_trigger() {
         eprintln!("hedge stop request={request_id}");
         let outcome = stream.expect_finished();
 
-        if outcome.tokens.last() != Some(&stop_id) {
-            continue;
+        // Do not `continue` past a candidate: a mid-span stop must still be
+        // the final token, and a run that never sampled the stop must terminate
+        // at the length limit. Filtering either shape would hide a suffix leak.
+        if let Some(position) = outcome.tokens.iter().position(|&token| token == stop_id) {
+            assert_eq!(
+                position,
+                outcome.tokens.len() - 1,
+                "stop {stop_id} was followed by {} more token(s) in candidate baseline_index={baseline_index}: {:?}",
+                outcome.tokens.len() - 1 - position,
+                outcome.tokens
+            );
+            assert!(matches!(
+                outcome.terminal,
+                Terminal::Finished {
+                    reason: FinishReason::Stop,
+                    stop_cause: Some(StopCause::Token(id)),
+                    completion_tokens,
+                    ..
+                } if id == stop_id && completion_tokens == outcome.tokens.len()
+            ));
+            eprintln!(
+                "hedge stop candidate baseline_index={baseline_index} token={stop_id} retained_len={}",
+                outcome.tokens.len()
+            );
+            stopped_cases += 1;
+        } else {
+            assert!(matches!(
+                outcome.terminal,
+                Terminal::Finished {
+                    reason: FinishReason::Length,
+                    stop_cause: None,
+                    completion_tokens,
+                    ..
+                } if completion_tokens == GENERATED_TOKENS && completion_tokens == outcome.tokens.len()
+            ));
+            no_stop_cases += 1;
         }
-        assert!(!outcome.tokens[..outcome.tokens.len() - 1].contains(&stop_id));
-        assert!(matches!(
-            outcome.terminal,
-            Terminal::Finished {
-                reason: FinishReason::Stop,
-                stop_cause: Some(StopCause::Token(id)),
-                completion_tokens,
-                ..
-            } if id == stop_id && completion_tokens == outcome.tokens.len()
-        ));
-        eprintln!(
-            "hedge stop candidate baseline_index={baseline_index} token={stop_id} retained_len={}",
-            outcome.tokens.len()
-        );
-        stopped_cases += 1;
     }
     assert!(
         stopped_cases > 0,
         "none of the candidate tokens produced a mid-span explicit stop"
     );
+    eprintln!("hedge stop child: {stopped_cases} stopped case(s), {no_stop_cases} no-stop case(s)");
 }
 
 /// P2 regression: a request that fits the target context window but lands in the
