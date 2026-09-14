@@ -3545,48 +3545,31 @@ impl LocalQwen3Lane {
             .collect();
         let target_tokens = self.select_step_tokens(bufs.all_logits(), &params, sample_seed)?;
         let mut all_results = build_verify_results(&expanded, &target_tokens)?;
-        // A terminal token ends the request even when it appears in the middle
-        // of a speculative span. Normalize every candidate before selecting a
-        // winner; otherwise a discarded suffix can win the hedge and advance
-        // the wrong KV/hidden state and acceptance statistics.
-        let (results_a, results_b) = all_results.split_at_mut(requests.len());
-        anyhow::ensure!(
-            results_b.len() == hedge_spans.len(),
-            "hedge returned {} B results for {} hedge spans",
-            results_b.len(),
-            hedge_spans.len()
-        );
         let trace = std::env::var_os("PEGAINFER_TEST_LOG").is_some();
-        let raw_a_lengths: Vec<usize> = if trace {
-            results_a
+        let raw_lengths: Vec<usize> = if trace {
+            all_results
                 .iter()
                 .map(|result| result.accepted_tokens.len())
                 .collect()
         } else {
             Vec::new()
         };
-        let raw_b_lengths: Vec<usize> = if trace {
-            results_b
-                .iter()
-                .map(|result| result.accepted_tokens.len())
-                .collect()
-        } else {
-            Vec::new()
-        };
-        for (result, req) in results_a.iter_mut().zip(requests) {
+        // Normalize every candidate before selecting a winner; a discarded
+        // suffix must not win the hedge or advance KV, hidden state or counters.
+        for (result, req) in all_results.iter_mut().zip(&expanded) {
             spec::truncate_after_terminal(
                 result,
                 &req.stop_policy,
                 &self.model.config().stop_token_ids,
             );
         }
-        for (slot, (idx, _)) in hedge_spans.iter().enumerate() {
-            spec::truncate_after_terminal(
-                &mut results_b[slot],
-                &requests[*idx].stop_policy,
-                &self.model.config().stop_token_ids,
-            );
-        }
+        let (results_a, results_b) = all_results.split_at(requests.len());
+        anyhow::ensure!(
+            results_b.len() == hedge_spans.len(),
+            "hedge returned {} B results for {} hedge spans",
+            results_b.len(),
+            hedge_spans.len()
+        );
         // Per request keep the best-accepting chain; ties keep chain A (no
         // copies). A later chain of the same request only replaces the
         // running winner when strictly better, so the final page/hidden
@@ -3653,7 +3636,7 @@ impl LocalQwen3Lane {
             Some(bufs.captured_hidden()),
             verify_round,
         )?;
-        if std::env::var_os("PEGAINFER_TEST_LOG").is_some() {
+        if trace {
             for idx in 0..requests.len() {
                 let has_hedge = hedge_spans
                     .iter()
@@ -3670,14 +3653,14 @@ impl LocalQwen3Lane {
                     .iter()
                     .enumerate()
                     .filter(|(_, (request_idx, _))| *request_idx == idx)
-                    .map(|(slot, _)| raw_b_lengths[slot].to_string())
+                    .map(|(slot, _)| raw_lengths[requests.len() + slot].to_string())
                     .collect::<Vec<_>>()
                     .join(",");
                 log::debug!(
                     "Qwen3 DFlash hedge detail round={} request={} raw_a={} raw_b_lens={} selected={} selected_len={} matched_draft={}",
                     verify_round,
                     requests[idx].request_id,
-                    raw_a_lengths[idx],
+                    raw_lengths[idx],
                     raw_b_lens,
                     selected,
                     final_results[idx].accepted_tokens.len(),

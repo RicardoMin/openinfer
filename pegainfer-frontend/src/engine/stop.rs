@@ -15,9 +15,8 @@ pub enum EosPolicy {
 
 /// Request-scoped token stopping policy.
 ///
-/// EOS is kept separate from caller stop tokens because the vLLM protocol
-/// reports them differently: EOS has no 'stop_reason', while a request stop
-/// reports the actual matching token ID.
+/// The vLLM primary EOS has no `stop_reason`; other matches, including
+/// secondary EOS IDs lowered into the explicit stop set, report the token ID.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StopPolicy {
     eos: EosPolicy,

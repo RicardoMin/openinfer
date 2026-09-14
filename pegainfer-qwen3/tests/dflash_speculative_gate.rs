@@ -677,8 +677,17 @@ fn dflash_hedged_midspan_stop_retains_trigger() {
             baseline_params,
             GENERATED_TOKENS,
         ))
-        .expect_finished()
-        .tokens;
+        .expect_finished();
+    assert!(matches!(
+        baseline.terminal,
+        Terminal::Finished {
+            reason: FinishReason::Length,
+            stop_cause: None,
+            completion_tokens,
+            ..
+        } if completion_tokens == GENERATED_TOKENS && completion_tokens == baseline.tokens.len()
+    ));
+    let baseline = baseline.tokens;
     let candidate_stops: Vec<(usize, u32)> = baseline
         .iter()
         .enumerate()

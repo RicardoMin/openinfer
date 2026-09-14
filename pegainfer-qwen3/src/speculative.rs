@@ -72,16 +72,13 @@ pub(crate) struct VerifyPlan<'a> {
 #[derive(Clone, Debug)]
 pub(crate) struct VerifyRequestResult {
     pub request_id: RequestId,
-    /// Number of draft candidates accepted before the posterior bonus.
+    /// Number of matched draft candidates retained after terminal truncation.
     pub matched_draft_tokens: usize,
-    /// Tokens to commit: the accepted draft prefix followed by the target's
-    /// posterior token at the first mismatch (or the block-end continuation
-    /// when every draft is accepted). Always `1..=K + 1` tokens, so a verify
-    /// step always makes at least one token of progress. The worker normalizes
-    /// this span after the first request-terminal token before DFlash context is
-    /// recorded; the executor asserts that invariant at commit rather than
-    /// re-truncating. The scheduler retains ownership of typed stop-cause
-    /// emission.
+    /// Tokens to commit: the accepted draft prefix and the target's posterior
+    /// token, unless a terminal draft ends the span before the posterior.
+    /// Always `1..=K + 1` tokens. The worker truncates after the first terminal
+    /// token before recording DFlash context; the executor checks this at
+    /// commit, and the scheduler emits the typed stop cause.
     pub accepted_tokens: Vec<u32>,
 }
 

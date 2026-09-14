@@ -237,8 +237,7 @@ pub enum Terminal {
     Finished {
         reason: FinishReason,
         /// Present for token-driven stop finishes. The triggering token remains
-        /// in `RequestUpdate.tokens`, with its real logprob in the matching
-        /// `RequestUpdate.logprobs` entry.
+        /// in `RequestUpdate.tokens`, with its matching logprob when requested.
         stop_cause: Option<StopCause>,
         prompt_tokens: usize,
         completion_tokens: usize,
