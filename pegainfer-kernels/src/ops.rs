@@ -17,6 +17,7 @@ pub use dsv2_routed_moe::Dsv2RouteSummary;
 pub use dsv2_routed_moe::Dsv2RoutedMoeScratch;
 #[cfg(feature = "deepseek-v2-lite")]
 pub use dsv2_routed_moe::dsv2_lite_route_logits_into;
+mod dflash2;
 mod elementwise;
 mod embedding;
 #[cfg(feature = "gemma4")]
@@ -87,6 +88,9 @@ pub use deepep::glm52_deepep_info;
 pub use deepep::glm52_ep_deepep_unique_id;
 #[cfg(feature = "deepseek-v2-lite")]
 pub use deepseek_v2_lite::*;
+pub use dflash2::DFLASH2_CANDIDATE_K;
+pub use dflash2::DFlash2Scratch;
+pub use dflash2::dflash2_select_into;
 pub use elementwise::SuppressIds;
 pub use elementwise::accumulate_bf16_token_scaled_to_f32_into;
 pub use elementwise::add_batch;
