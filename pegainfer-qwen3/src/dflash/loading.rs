@@ -170,8 +170,8 @@ impl DFlashDraftModel {
                     .collect()
             })
             .transpose()?;
-        // Published Speculators DFlash2 checkpoints train their own untied
-        // embedding and output head; reusing the target's changes the model.
+        // The supported Speculators checkpoints carry untied embedding and
+        // output-head weights; reusing the target's would change the model.
         let (embed_tokens, lm_head) = if config.conv.is_some() {
             (
                 Some(load_tensor_2d(
@@ -226,14 +226,11 @@ impl DFlashDraftModel {
                 rank,
             )?;
             loader.finish()?;
-            // Keep weights and reservation identical for selector-on/off A/B.
-            let enabled = std::env::var_os("DFLASH2_NO_SELECTOR").is_none();
-            log::info!("selector: enabled={enabled}, rank={rank}, top_k=16");
+            log::info!("selector: rank={rank}, top_k=16");
             Some(SelectorHead {
                 projection: loader.take(w),
                 predecessor: loader.take(a),
                 successor: loader.take(b),
-                enabled,
             })
         } else {
             None

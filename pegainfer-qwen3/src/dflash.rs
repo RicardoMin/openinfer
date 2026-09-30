@@ -920,7 +920,7 @@ impl DFlashDraftModel {
     }
 
     pub(crate) fn uses_selector(&self) -> bool {
-        self.selector.as_ref().is_some_and(|head| head.enabled)
+        self.selector.is_some()
     }
 
     pub(crate) fn selected_draft_tokens(

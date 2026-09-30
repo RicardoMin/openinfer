@@ -1456,15 +1456,9 @@ unsafe extern "C" {
     pub fn pegainfer_kernels_last_error() -> *const std::os::raw::c_char;
 }
 
-// Native DFlash2 strict candidate selection. All entries guard C++ exceptions;
+// Native DFlash2 candidate selection. All entries guard C++ exceptions;
 // nonfinite device inputs are reported separately through the error flag.
 unsafe extern "C" {
-    pub fn dflash2_topk_workspace_bytes_cuda(
-        vocab: i32,
-        bytes: *mut usize,
-        stream: CUstream,
-    ) -> i32;
-
     pub fn dflash2_prepare_cuda(
         logits: *const Half,
         hidden: *const Half,
@@ -1476,15 +1470,13 @@ unsafe extern "C" {
         gated: *mut f32,
         successors: *mut f32,
         error: *mut u32,
-        keys_in: *mut u64,
-        keys_out: *mut u64,
-        workspace: *mut std::ffi::c_void,
-        workspace_bytes: usize,
+        compact: *mut Half,
+        topk_values: *mut Half,
+        row_states: *mut u8,
         batch: i32,
         block_size: i32,
         vocab: i32,
         rank: i32,
-        chunk_rows: i32,
         stream: CUstream,
     ) -> i32;
 

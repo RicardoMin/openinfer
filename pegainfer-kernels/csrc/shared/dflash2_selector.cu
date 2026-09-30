@@ -2,8 +2,8 @@
 #include <cuda_runtime.h>
 #include <math_constants.h>
 #include <cub/block/block_radix_sort.cuh>
-#include <cub/device/device_topk.cuh>
-#include <cuda/stream>
+#include <flashinfer/sampling.cuh>
+#include <flashinfer/topk.cuh>
 
 #include <algorithm>
 #include <climits>
@@ -36,8 +36,8 @@ int blocks(int64_t elements) {
   return static_cast<int>(std::min<int64_t>((elements + 255) / 256, 65535));
 }
 
-// A unique key orders logits descending, then token IDs ascending, including
-// ties at the K/K+1 boundary. Canonicalize signed zero without perturbing logits.
+// Sort the selected candidates by score, then token ID. Membership at a tied
+// top-16 boundary follows FlashInfer's deterministic radix selection.
 __device__ uint64_t score_key(float score, unsigned token) {
   if (score == 0.0f) {
     score = 0.0f;
@@ -53,48 +53,44 @@ __device__ float key_score(uint64_t key) {
   return __uint_as_float(ordered ^ ((ordered >> 31) ? 0x80000000u : 0xffffffffu));
 }
 
-__global__ void pack_keys(const __nv_bfloat16* logits, uint64_t* keys,
-                         int vocab, int block_size, int chunk_rows,
-                         int row_start, int rows, unsigned* error) {
-  const int64_t count = static_cast<int64_t>(chunk_rows) * vocab;
+__global__ void compact_logits(const __nv_bfloat16* logits, __nv_bfloat16* compact,
+                              int vocab, int block_size, int rows, unsigned* error) {
+  const int64_t count = static_cast<int64_t>(rows) * vocab;
 
   for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        index < count; index += static_cast<int64_t>(gridDim.x) * blockDim.x) {
-    const int64_t row = static_cast<int64_t>(row_start) + index / vocab;
+    const int64_t row = index / vocab;
     const unsigned token = index % vocab;
-    float score = -CUDART_INF_F;
-
-    if (row < rows) {
-      const int request = row / (block_size - 1);
-      const int position = row % (block_size - 1);
-      const int64_t source = static_cast<int64_t>(request) * block_size + 1 + position;
-      score = __bfloat162float(logits[source * vocab + token]);
-      if (isnan(score) || score == CUDART_INF_F) {
-        atomicOr(error, kInvalidLogit);
-        score = -CUDART_INF_F;
-      }
+    const int request = row / (block_size - 1);
+    const int position = row % (block_size - 1);
+    const int64_t source = static_cast<int64_t>(request) * block_size + 1 + position;
+    float score = __bfloat162float(logits[source * vocab + token]);
+    if (isnan(score) || score == CUDART_INF_F) {
+      atomicOr(error, kInvalidLogit);
+      score = -CUDART_INF_F;
+    } else if (score == 0.0f) {
+      score = 0.0f;
     }
-
-    keys[index] = score_key(score, token);
+    compact[index] = __float2bfloat16_rn(score);
   }
 }
 
-// DeviceTopK returns an unordered set. Sort just those 16 unique keys, not the
+// RadixTopK returns an unordered set. Sort just those 16 candidates, not the
 // whole vocabulary. Zero padding sorts below every encoded key, including -Inf.
-__global__ void unpack_candidates(const uint64_t* keys, unsigned* ids, float* unary,
-                                 int row_start, int rows, unsigned* error) {
+__global__ void unpack_candidates(const __nv_bfloat16* values, unsigned* ids,
+                                 float* unary, unsigned* error) {
   using Sort = cub::BlockRadixSort<uint64_t, 32, 1>;
   __shared__ typename Sort::TempStorage storage;
 
-  const int64_t row = static_cast<int64_t>(row_start) + blockIdx.x;
+  const int64_t row = blockIdx.x;
+  const int64_t output = row * kCandidates + threadIdx.x;
   uint64_t key[1] = {
       threadIdx.x < kCandidates
-          ? keys[static_cast<int64_t>(blockIdx.x) * kCandidates + threadIdx.x]
+          ? score_key(__bfloat162float(values[output]), ids[output])
           : 0};
   Sort(storage).SortDescending(key);
 
-  if (row < rows && threadIdx.x < kCandidates) {
-    const int64_t output = row * kCandidates + threadIdx.x;
+  if (threadIdx.x < kCandidates) {
     ids[output] = 0xffffffffu - static_cast<unsigned>(key[0]);
     unary[output] = key_score(key[0]);
     if (!isfinite(unary[output])) {
@@ -189,69 +185,39 @@ __global__ void walk(const float* edges, const unsigned* ids, unsigned* selected
   }
 }
 
-auto topk_environment(cudaStream_t stream) {
-  // CUB permits non-deterministic membership only among equal keys. Each key
-  // includes its token ID, so the top-16 set is unique even when logits tie.
-  auto requirements = cuda::execution::require(
-      cuda::execution::determinism::not_guaranteed,
-      cuda::execution::output_ordering::unsorted);
-  return cuda::std::execution::env{cuda::stream_ref{stream}, requirements};
-}
-
 }  // namespace
-
-extern "C" int dflash2_topk_workspace_bytes_cuda(int vocab, size_t* bytes,
-                                               cudaStream_t stream) {
-  PEGAINFER_FFI_GUARD_BEGIN
-  require(vocab >= kCandidates, "DFlash2 vocab must contain at least 16 candidates");
-  require(bytes != nullptr, "DFlash2 null workspace size output");
-
-  check_cuda(cub::DeviceTopK::MaxKeys(
-      nullptr, *bytes, static_cast<const uint64_t*>(nullptr),
-      static_cast<uint64_t*>(nullptr), vocab, kCandidates, topk_environment(stream)));
-
-  return 0;
-  PEGAINFER_FFI_GUARD_END(-1)
-}
 
 extern "C" int dflash2_prepare_cuda(
     const __nv_bfloat16* logits, const __nv_bfloat16* hidden,
     const __nv_bfloat16* predecessor, const __nv_bfloat16* successor,
     const unsigned* anchors, unsigned* ids, float* unary, float* gated,
-    float* successors, unsigned* error, uint64_t* keys_in, uint64_t* keys_out,
-    void* workspace, size_t workspace_bytes, int batch, int block_size,
-    int vocab, int rank, int chunk_rows, cudaStream_t stream) {
+    float* successors, unsigned* error, __nv_bfloat16* compact,
+    __nv_bfloat16* topk_values, uint8_t* row_states, int batch, int block_size,
+    int vocab, int rank, cudaStream_t stream) {
   PEGAINFER_FFI_GUARD_BEGIN
-  require(batch > 0 && block_size >= 2 && rank > 0 && chunk_rows > 0 &&
+  require(batch > 0 && block_size >= 2 && rank > 0 &&
               vocab >= kCandidates &&
               static_cast<int64_t>(batch) * block_size <= INT_MAX,
           "DFlash2 invalid prepare dimensions");
   require(logits && hidden && predecessor && successor && anchors && ids && unary &&
-              gated && successors && error && keys_in && keys_out && workspace,
+              gated && successors && error && compact && topk_values && row_states,
           "DFlash2 null prepare pointer");
 
   check_cuda(cudaMemsetAsync(error, 0, sizeof(unsigned), stream));
   const int rows = batch * (block_size - 1);
-  const auto env = topk_environment(stream);
 
-  for (int64_t row_start = 0; row_start < rows; row_start += chunk_rows) {
-    pack_keys<<<blocks(static_cast<int64_t>(chunk_rows) * vocab), 256, 0, stream>>>(
-        logits, keys_in, vocab, block_size, chunk_rows, row_start, rows, error);
-    check_cuda(cudaPeekAtLastError());
+  compact_logits<<<blocks(static_cast<int64_t>(rows) * vocab), 256, 0, stream>>>(
+      logits, compact, vocab, block_size, rows, error);
+  check_cuda(cudaPeekAtLastError());
 
-    // Each row reuses the same library workspace on the owning stream.
-    for (int row = 0; row < chunk_rows; ++row) {
-      check_cuda(cub::DeviceTopK::MaxKeys(
-          workspace, workspace_bytes,
-          static_cast<const uint64_t*>(keys_in) + static_cast<int64_t>(row) * vocab,
-          keys_out + static_cast<int64_t>(row) * kCandidates,
-          vocab, kCandidates, env));
-    }
+  check_cuda(flashinfer::sampling::RadixTopKMultiCTA<__nv_bfloat16, int32_t>(
+      compact, reinterpret_cast<int32_t*>(ids), topk_values, nullptr,
+      rows, kCandidates, vocab,
+      reinterpret_cast<flashinfer::sampling::RadixRowState*>(row_states),
+      /*deterministic=*/true, stream));
 
-    unpack_candidates<<<chunk_rows, 32, 0, stream>>>(
-        keys_out, ids, unary, row_start, rows, error);
-    check_cuda(cudaPeekAtLastError());
-  }
+  unpack_candidates<<<rows, 32, 0, stream>>>(topk_values, ids, unary, error);
+  check_cuda(cudaPeekAtLastError());
 
   gather_gated_codebooks<<<blocks(static_cast<int64_t>(rows) * kCandidates * rank), 256, 0, stream>>>(
       hidden, predecessor, successor, anchors, ids, gated, successors,
