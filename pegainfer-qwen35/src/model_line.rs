@@ -179,7 +179,7 @@ impl ModelLine for Qwen35Line {
             resolve_decode_overlap(ctx.shared.decode_overlap)
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?,
         )
-        .map(LaunchedEngine::Handle)
+        .map(LaunchedEngine::Stepped)
     }
 }
 

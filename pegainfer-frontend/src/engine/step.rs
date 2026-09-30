@@ -78,9 +78,9 @@ pub struct QueuedRequest {
     pub request: Request,
 }
 
-/// Everything one scheduler step produced, in one message. The scheduler-side
-/// ledger sends exactly one per step that touched any request; an idle step
-/// sends nothing.
+/// Everything one scheduler step produced, in one message. Empty `updates`
+/// notify the frontend of changed metrics, for example after cancellation.
+/// A step with no request updates or metric changes sends nothing.
 #[derive(Debug, Default)]
 pub struct StepOutputs {
     pub updates: Vec<RequestUpdate>,

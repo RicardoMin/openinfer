@@ -8,7 +8,7 @@
 //! crossbeam (sync consumer on the scheduler thread; senders never block on
 //! unbounded channels), the step stream is tokio (async consumer in the
 //! protocol stack; the sync producer's send never blocks either), metrics are
-//! a shared cell (read-only pull, deliberately unsubscribable — see
+//! a shared cell, with changes signaled on the step stream (see
 //! [`MetricsPublisher`]).
 //!
 //! How many schedulers an engine runs and what each one means (DP replicas,
@@ -51,18 +51,19 @@ pub struct SchedulerBackend {
 /// Sole writer of a scheduler's metrics cell; the driver publishes once per
 /// iteration from [`super::Scheduler::metrics`].
 ///
-/// Deliberately a plain cell and not a `watch` channel: the driver busy-polls,
-/// so a subscription edge (`changed()`) would fire per spin and turn any
-/// subscriber into a message flood at idle. With only
-/// [`SchedulerHandle::metrics`] to read it, "notify me on metrics change" is
-/// unrepresentable — consumers pull the snapshot at the moment they need one.
+/// The driver reports changes through the step stream, including steps with
+/// no request output. Repeated idle publishes send no notification; consumers
+/// read the latest snapshot through [`SchedulerHandle::metrics`].
 /// A `Mutex` (not per-field atomics) so a reader never sees fields torn
 /// across two steps; both sides touch it uncontended for nanoseconds.
 pub struct MetricsPublisher(Arc<Mutex<SchedulerMetrics>>);
 
 impl MetricsPublisher {
-    pub(crate) fn publish(&self, snapshot: &SchedulerMetrics) {
-        *self.0.lock().expect("metrics cell poisoned") = *snapshot;
+    pub(crate) fn publish(&self, snapshot: &SchedulerMetrics) -> bool {
+        let mut current = self.0.lock().expect("metrics cell poisoned");
+        let changed = *current != *snapshot;
+        *current = *snapshot;
+        changed
     }
 }
 
@@ -102,9 +103,8 @@ impl SchedulerHandle {
         self.steps.take()
     }
 
-    /// The scheduler's most recent metrics snapshot. Pull-only by design (see
-    /// [`MetricsPublisher`]): read it at the moment you need one — routing a
-    /// request, stamping stats onto an outgoing batch, serving a scrape.
+    /// The scheduler's most recent metrics snapshot. Read it when routing a
+    /// request, receiving a step, or serving a scrape.
     pub fn metrics(&self) -> SchedulerMetrics {
         *self.metrics.lock().expect("metrics cell poisoned")
     }

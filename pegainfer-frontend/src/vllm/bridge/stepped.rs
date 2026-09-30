@@ -87,9 +87,8 @@ impl SteppedEngineBridge {
             .take_steps()
             .context("partition step stream already taken")?;
         let mut spec = SpecDecodeTracker::default();
-        // Stats are pull-at-send: no push task, the load cell is read when a
-        // batch goes out (and once here, so the frontend's gauges initialize
-        // before any traffic). An idle engine publishes nothing.
+        // Read the load cell when a step arrives, including a metrics-only
+        // notification, and once here to initialize the frontend's gauges.
         let BridgeLink {
             mut input,
             output_tx,
@@ -254,28 +253,7 @@ impl SteppedEngineBridge {
             }
         }
 
-        if outputs.is_empty() {
-            // A drafted step with no batch to ride would strand its increment
-            // until the next batch, which may never come.
-            let stats = self.stats(spec);
-            if stats.spec_decoding_stats.is_some() {
-                send_outputs(
-                    output_tx,
-                    RequestBatchOutputs {
-                        engine_index: self.engine_index,
-                        scheduler_stats: Some(Box::new(stats)),
-                        timestamp: now_secs_f64(),
-                        ..Default::default()
-                    }
-                    .into(),
-                )?;
-            }
-            return Ok(());
-        }
-        // The cell already holds this step's snapshot (the driver publishes
-        // load before committing the step), so the batch carries stats that
-        // match its own tokens — a finishing batch reports the drained state
-        // and the gauges settle instead of freezing at the last busy value.
+        // Forward the latest load even when cancellation left no request output.
         send_outputs(
             output_tx,
             RequestBatchOutputs {
@@ -467,7 +445,7 @@ struct SteppedStream {
     request_id: String,
     control: RequestControl,
     /// Queued/Scheduled wire events, held until the request's first shipped
-    /// output (a scheduled-only update ships nothing on its own).
+    /// output (a scheduled-only update produces no request output).
     first_token_events: Option<Vec<EngineCoreEvent>>,
     /// Set by `Scheduled`; a request refused or failed while still queued
     /// never prefilled and reports no prefill stats.
@@ -687,6 +665,7 @@ mod tests {
     use super::*;
     use crate::engine::PromptEcho;
     use crate::engine::RejectReason;
+    use crate::engine::ScheduledInfo;
     use crate::engine::StopPolicy;
     use crate::engine::TokenLogprob;
     use crate::engine::scheduler_pair;
@@ -745,6 +724,55 @@ mod tests {
             engine_index: 0,
             data_parallel_size: 1,
         }
+    }
+
+    #[test]
+    fn scheduled_and_metrics_only_steps_publish_load_without_request_outputs() {
+        let (handle, backend) = scheduler_pair();
+        let control = handle.submit(request());
+        let mut scheduled = RequestUpdate::empty(control.id());
+        let now = Instant::now();
+        scheduled.scheduled = Some(ScheduledInfo {
+            queued_at: now,
+            scheduled_at: now,
+            prompt_tokens: 2,
+        });
+        let mut streams = HashMap::from([(
+            control.id(),
+            SteppedStream::new("scheduled".into(), control, Span::noop(), None),
+        )]);
+        let bridge = bridge(handle);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut spec = SpecDecodeTracker::default();
+        for (running, updates) in [(1, vec![scheduled]), (0, Vec::new())] {
+            backend.metrics.publish(&crate::engine::SchedulerMetrics {
+                num_running_reqs: running,
+                kv_used_blocks: running,
+                kv_total_blocks: 4,
+                ..Default::default()
+            });
+            bridge
+                .dispatch_step(
+                    StepOutputs { updates },
+                    &UnixAnchor::now(),
+                    &mut streams,
+                    &mut HashMap::new(),
+                    &mut spec,
+                    &tx,
+                )
+                .unwrap();
+            let EngineCoreOutputs::RequestBatch(batch) = rx.try_recv().expect("load batch") else {
+                panic!("expected scheduler stats");
+            };
+            assert!(batch.outputs.is_empty());
+            assert!(batch.finished_requests.is_none());
+            let stats = batch.scheduler_stats.expect("scheduler stats");
+            assert_eq!(stats.num_running_reqs, running);
+            assert_eq!(stats.num_waiting_reqs, 0);
+            assert!((stats.kv_cache_usage - running as f64 / 4.0).abs() < f64::EPSILON);
+            assert!(stats.spec_decoding_stats.is_none());
+        }
+        assert!(rx.try_recv().is_err());
     }
 
     fn wire_request(completion: Option<i32>, prompt: Option<i32>) -> EngineCoreRequest {

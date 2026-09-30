@@ -2,21 +2,21 @@
 //!
 //! The first request publishes the 256-token boundary. The second identical
 //! request must restore both state families at that boundary and report the
-//! joint hit through `TokenEvent::Scheduled`.
+//! joint hit through `RequestUpdate::cached_tokens`.
 
 use std::path::Path;
 
-use pegainfer_frontend::engine::EngineHandle;
 use pegainfer_frontend::engine::FinishReason;
-use pegainfer_frontend::engine::GenerateRequest;
-use pegainfer_frontend::engine::TokenEvent;
+use pegainfer_frontend::engine::RequestControl;
+use pegainfer_frontend::engine::Terminal;
 use pegainfer_frontend::engine::TokenLogprob;
-use pegainfer_frontend::engine::TokenSink;
 use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_qwen35::Qwen35LaunchOptions;
 use pegainfer_qwen35::Qwen35SchedulerPolicy;
 
 mod common;
+
+use common::EngineHarness;
 
 const PREFIX_BOUNDARY: usize = 256;
 const PROMPT_TOKENS: usize = 320;
@@ -30,7 +30,7 @@ fn model_path_or_skip() -> Option<String> {
     common::model_path_or_skip("prefix_cache")
 }
 
-fn start_engine(model_path: &str, tp_size: usize, prefix_cache_mib: usize) -> EngineHandle {
+fn start_engine(model_path: &str, tp_size: usize, prefix_cache_mib: usize) -> EngineHarness {
     start_engine_with_graph(model_path, tp_size, prefix_cache_mib, tp_size == 1)
 }
 
@@ -39,14 +39,15 @@ fn start_engine_with_graph(
     tp_size: usize,
     prefix_cache_mib: usize,
     cuda_graph: bool,
-) -> EngineHandle {
-    pegainfer_qwen35::launch_with_options_policy_and_overlap(
+) -> EngineHarness {
+    let handle = pegainfer_qwen35::launch_with_options_policy_and_overlap(
         Path::new(model_path),
         Qwen35LaunchOptions::new(0, tp_size, cuda_graph, 2, 1024, prefix_cache_mib),
         Qwen35SchedulerPolicy::Off,
         pegainfer_qwen35::Qwen35DecodeOverlap::Off,
     )
-    .unwrap_or_else(|err| panic!("failed to start Qwen3.5 TP{tp_size} prefix-cache engine: {err}"))
+    .unwrap_or_else(|err| panic!("failed to start Qwen3.5 TP{tp_size} prefix-cache engine: {err}"));
+    EngineHarness::new(handle)
 }
 
 struct Generation {
@@ -56,73 +57,71 @@ struct Generation {
 }
 
 fn submit(
-    handle: &EngineHandle,
+    handle: &EngineHarness,
     prompt_tokens: Vec<u32>,
     max_tokens: usize,
     logprobs: usize,
-) -> pegainfer_frontend::engine::TokenStreamReceiver {
-    let (token_tx, rx) = TokenSink::standalone();
-    handle
-        .submit(GenerateRequest {
-            trace_parent: None,
-            request_id: None,
-            queued_at_unix_s: None,
-            data_parallel_rank: None,
-            prompt_tokens,
-            params: SamplingParams {
-                ignore_eos: true,
-                ..SamplingParams::default()
-            },
-            max_tokens,
-            lora_adapter: None,
-            kv_transfer_params: None,
-            token_tx,
-            logprobs: (logprobs > 0).then_some(logprobs),
-            prompt_logprobs: None,
-        })
-        .expect("submit failed");
-
-    rx
+) -> RequestControl {
+    let mut request = common::request(
+        prompt_tokens,
+        SamplingParams {
+            ignore_eos: true,
+            ..SamplingParams::default()
+        },
+        max_tokens,
+    );
+    request.logprobs = (logprobs > 0).then_some(logprobs);
+    handle.submit(request)
 }
 
 fn generate(
-    handle: &EngineHandle,
+    handle: &mut EngineHarness,
     prompt_tokens: Vec<u32>,
     max_tokens: usize,
     logprobs: usize,
 ) -> Generation {
-    let mut rx = submit(handle, prompt_tokens, max_tokens, logprobs);
+    let control = submit(handle, prompt_tokens, max_tokens, logprobs);
     let mut cached_tokens = None;
+    let mut scheduled = false;
     let mut generated_tokens = Vec::with_capacity(max_tokens);
     let mut generated_logprobs = Vec::with_capacity(max_tokens);
     loop {
-        match rx.blocking_recv().map(|(_, event)| event) {
-            Some(TokenEvent::Scheduled {
-                cached_tokens: hit, ..
-            }) => {
-                cached_tokens = Some(hit);
+        let update = handle.next(control.id());
+        if update.scheduled.is_some() {
+            assert!(!scheduled, "request was admitted twice");
+            scheduled = true;
+        }
+        if let Some(hit) = update.cached_tokens {
+            assert!(
+                cached_tokens.replace(hit).is_none(),
+                "cache hit reported twice"
+            );
+        }
+        generated_tokens.extend(update.tokens);
+        generated_logprobs.extend(update.logprobs);
+        if let Some(terminal) = update.terminal {
+            match terminal {
+                Terminal::Finished {
+                    reason,
+                    completion_tokens,
+                    ..
+                } => {
+                    assert!(scheduled, "request was not admitted");
+                    assert_eq!(reason, FinishReason::Length);
+                    assert_eq!(completion_tokens, max_tokens);
+                    return Generation {
+                        cached_tokens: cached_tokens.expect("request did not report cached_tokens"),
+                        tokens: generated_tokens,
+                        logprobs: generated_logprobs,
+                    };
+                }
+                terminal => panic!("generation did not finish: {terminal:?}"),
             }
-            Some(TokenEvent::Token { id, logprob }) => {
-                generated_tokens.push(id);
-                generated_logprobs.push(logprob);
-            }
-            Some(TokenEvent::PromptTokens { .. } | TokenEvent::KvTransfer { .. }) => {}
-            Some(TokenEvent::Finished { finish_reason, .. }) => {
-                assert_eq!(finish_reason, FinishReason::Length);
-                return Generation {
-                    cached_tokens: cached_tokens.expect("request did not emit Scheduled"),
-                    tokens: generated_tokens,
-                    logprobs: generated_logprobs,
-                };
-            }
-            Some(TokenEvent::Error { message, .. }) => panic!("generation failed: {message}"),
-            Some(TokenEvent::Rejected { message, .. }) => panic!("generation rejected: {message}"),
-            None => panic!("scheduler channel closed without Finished"),
         }
     }
 }
 
-fn generate_one(handle: &EngineHandle, prompt_tokens: Vec<u32>) -> (usize, u32) {
+fn generate_one(handle: &mut EngineHarness, prompt_tokens: Vec<u32>) -> (usize, u32) {
     let result = generate(handle, prompt_tokens, 1, 0);
     (
         result.cached_tokens,
@@ -209,11 +208,11 @@ fn joint_restore_and_unpinned_lru_eviction_preserve_output() {
         PROMPT_TOKENS,
     );
 
-    let handle = start_engine(model_path, 1, PREFIX_CACHE_MIB);
-    let (cold_cached, cold_token) = generate_one(&handle, prompt_a.clone());
+    let mut handle = start_engine(model_path, 1, PREFIX_CACHE_MIB);
+    let (cold_cached, cold_token) = generate_one(&mut handle, prompt_a.clone());
     assert_eq!(cold_cached, 0, "first request must be cold");
 
-    let (warm_cached, warm_token) = generate_one(&handle, prompt_a.clone());
+    let (warm_cached, warm_token) = generate_one(&mut handle, prompt_a.clone());
     assert_eq!(
         warm_cached, PREFIX_BOUNDARY,
         "the longest jointly committed boundary should be restored"
@@ -223,22 +222,23 @@ fn joint_restore_and_unpinned_lru_eviction_preserve_output() {
         "joint restore must preserve greedy output"
     );
 
-    let (beta_cold_cached, beta_token) = generate_one(&handle, prompt_b.clone());
+    let (beta_cold_cached, beta_token) = generate_one(&mut handle, prompt_b.clone());
     assert_eq!(beta_cold_cached, 0, "new beta prefix must be cold");
 
-    let (alpha_touched_cached, _) = generate_one(&handle, prompt_a);
+    let (alpha_touched_cached, _) = generate_one(&mut handle, prompt_a);
     assert_eq!(
         alpha_touched_cached, PREFIX_BOUNDARY,
         "alpha lookup must refresh its snapshot LRU position"
     );
 
-    let (gamma_cold_cached, _) = generate_one(&handle, prompt_c);
+    let (gamma_cold_cached, _) = generate_one(&mut handle, prompt_c);
     assert_eq!(
         gamma_cold_cached, 0,
         "new gamma prefix must insert under snapshot pressure"
     );
 
-    let (beta_after_eviction_cached, beta_after_eviction_token) = generate_one(&handle, prompt_b);
+    let (beta_after_eviction_cached, beta_after_eviction_token) =
+        generate_one(&mut handle, prompt_b);
     assert_eq!(
         beta_after_eviction_cached, 0,
         "beta KV may remain resident, but its evicted snapshot must force a joint miss"
@@ -260,23 +260,23 @@ fn boundary_selection_and_multitoken_restore_preserve_logits() {
         "Boundary coverage checks exact alignment, prefix extension, and joint recurrent state restore. ",
         576,
     );
-    let handle = start_engine(&model_path, 1, 512);
+    let mut handle = start_engine(&model_path, 1, 512);
 
-    let cold = generate(&handle, long_prompt.clone(), TRACE_TOKENS, TOP_LOGPROBS);
+    let cold = generate(&mut handle, long_prompt.clone(), TRACE_TOKENS, TOP_LOGPROBS);
     assert_eq!(cold.cached_tokens, 0);
-    let warm = generate(&handle, long_prompt.clone(), TRACE_TOKENS, TOP_LOGPROBS);
+    let warm = generate(&mut handle, long_prompt.clone(), TRACE_TOKENS, TOP_LOGPROBS);
     assert_eq!(warm.cached_tokens, 512);
     assert_trace_close("tp1 576-token restore", &cold, &warm);
 
-    let exact_512 = generate(&handle, long_prompt[..512].to_vec(), 1, 0);
+    let exact_512 = generate(&mut handle, long_prompt[..512].to_vec(), 1, 0);
     assert_eq!(
         exact_512.cached_tokens, 256,
         "an exactly aligned prompt must retain one token for final prefill"
     );
-    let exact_256 = generate(&handle, long_prompt[..256].to_vec(), 1, 0);
+    let exact_256 = generate(&mut handle, long_prompt[..256].to_vec(), 1, 0);
     assert_eq!(exact_256.cached_tokens, 0);
 
-    let extended = generate(&handle, long_prompt[..320].to_vec(), 1, 0);
+    let extended = generate(&mut handle, long_prompt[..320].to_vec(), 1, 0);
     assert_eq!(extended.cached_tokens, 256);
 }
 
@@ -294,41 +294,56 @@ fn restore_during_live_decode(
         "Joint prefix restore must preserve logits while another request decodes. ",
         576,
     );
-    let handle = pegainfer_qwen35::launch_with_options_policy_and_overlap(
-        Path::new(&model_path),
-        Qwen35LaunchOptions::new(0, tp_size, cuda_graph, 2, 1024, 128),
-        Qwen35SchedulerPolicy::Off,
-        overlap,
-    )
-    .unwrap();
-    let cold = generate(&handle, prompt.clone(), TRACE_TOKENS, TOP_LOGPROBS);
-    let mut background = submit(&handle, vec![9707], 1024, 0);
-    loop {
-        match background.blocking_recv().map(|(_, event)| event) {
-            Some(TokenEvent::Token { .. }) => break,
-            Some(TokenEvent::Scheduled { .. }) => {}
-            event => panic!("background decode did not start: {event:?}"),
+    let start_engine = |prefix_cache_mib| {
+        pegainfer_qwen35::launch_with_options_policy_and_overlap(
+            Path::new(&model_path),
+            Qwen35LaunchOptions::new(0, tp_size, cuda_graph, 2, PREFIX_BOUNDARY, prefix_cache_mib),
+            Qwen35SchedulerPolicy::Off,
+            overlap,
+        )
+        .map(EngineHarness::new)
+        .unwrap()
+    };
+    let generate_with_background = |handle: &mut EngineHarness| {
+        let background = submit(handle, vec![9707], 1024, 0);
+        let mut background_tokens = loop {
+            let update = handle.next(background.id());
+            assert!(
+                update.terminal.is_none(),
+                "background decode ended before the probe"
+            );
+            if !update.tokens.is_empty() {
+                break update.tokens.len();
+            }
+        };
+        let generation = generate(handle, prompt.clone(), TRACE_TOKENS, TOP_LOGPROBS);
+        while let Some(update) = handle.try_next(background.id()) {
+            background_tokens += update.tokens.len();
+            assert!(
+                update.terminal.is_none(),
+                "background finished before the mixed-load probe"
+            );
         }
-    }
-    let warm = generate(&handle, prompt.clone(), TRACE_TOKENS, TOP_LOGPROBS);
+        assert!(background_tokens < 1024);
+        background.abort();
+        generation
+    };
+
+    // Compare logprobs with the same decode batch shape and cold prefill chunk size.
+    let mixed_cold = {
+        let mut reference = start_engine(0);
+        let generation = generate_with_background(&mut reference);
+        assert_eq!(generation.cached_tokens, 0);
+        generation
+    };
+    let mut handle = start_engine(128);
+    let cold = generate(&mut handle, prompt.clone(), TRACE_TOKENS, TOP_LOGPROBS);
+    assert_eq!(cold.cached_tokens, 0);
+    assert_eq!(mixed_cold.tokens, cold.tokens);
+    let warm = generate_with_background(&mut handle);
     assert_eq!(warm.cached_tokens, 512);
-    assert_trace_close("restore during live decode", &cold, &warm);
-    let mut background_tokens = 1;
-    while let Ok((_, event)) = background.try_recv() {
-        match event {
-            TokenEvent::Token { .. } => background_tokens += 1,
-            TokenEvent::Finished { .. } => {
-                panic!("background finished before the mixed-load probe")
-            }
-            TokenEvent::Error { message, .. } | TokenEvent::Rejected { message, .. } => {
-                panic!("{message}")
-            }
-            _ => {}
-        }
-    }
-    assert!(background_tokens < 1024);
-    drop(background); // Exercise cancellation cleanup followed by another cache hit.
-    let again = generate(&handle, prompt, TRACE_TOKENS, TOP_LOGPROBS);
+    assert_trace_close("restore during live decode", &mixed_cold, &warm);
+    let again = generate(&mut handle, prompt, TRACE_TOKENS, TOP_LOGPROBS);
     assert_eq!(again.cached_tokens, 512);
     assert_trace_close("restore after cancellation", &cold, &again);
 }

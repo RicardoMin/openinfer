@@ -171,7 +171,7 @@ impl SingleGpuBackend {
             anyhow::bail!("single-GPU commit received TP chunk state")
         };
         for (i, (kv, rec)) in kvs.iter_mut().zip(recs.iter()).enumerate() {
-            let is_final = chunk.ends[i] == chunk.reqs[i].prompt_tokens.len();
+            let is_final = chunk.ends[i] == chunk.reqs[i].request.prompt_tokens.len();
             let boundary = self
                 .kv_cache
                 .apply_prefill(kv, is_final.then_some(tokens[i]))?;
@@ -287,7 +287,7 @@ impl SingleGpuBackend {
         self.kv_cache.pool().available_blocks()
     }
 
-    pub(super) fn active_joint_prefix_pages(&self, req: &SchedulerRequest) -> usize {
+    pub(super) fn active_joint_prefix_pages(&self, req: &Request) -> usize {
         self.kv_cache
             .active_joint_prefix_pages(&req.prompt_tokens, req.lora_adapter.as_deref())
     }
@@ -302,7 +302,7 @@ impl SingleGpuBackend {
 
     pub(super) fn alloc_prefill_state(
         &mut self,
-        req: &SchedulerRequest,
+        req: &Request,
     ) -> Result<(PrefillBackendState, usize), AdmissionError> {
         let mut rec = self
             .alloc_recurrent()
@@ -492,7 +492,7 @@ impl SingleGpuBackend {
 
     pub(super) fn sample_prefill_logits(
         &mut self,
-        pending: &[SchedulerRequest],
+        pending: &[QueuedRequest],
         logits: &HiddenStates,
         sample_seed: u64,
     ) -> Result<(Vec<u32>, Vec<Option<TokenLogprob>>)> {
@@ -501,10 +501,11 @@ impl SingleGpuBackend {
             pending.len(),
             "Qwen3.5 prefill logits rows must preserve pending request order"
         );
-        let requested_logprobs: Vec<Option<usize>> = pending.iter().map(|r| r.logprobs).collect();
+        let requested_logprobs: Vec<Option<usize>> =
+            pending.iter().map(|r| r.request.logprobs).collect();
         let cpu_logits =
             snapshot_requested_logprobs(self.model.device_ctx(), logits, &requested_logprobs)?;
-        let params_refs: Vec<&SamplingParams> = pending.iter().map(|r| &r.params).collect();
+        let params_refs: Vec<&SamplingParams> = pending.iter().map(|r| &r.request.params).collect();
         let tokens = self.model.select_tokens_from_logits_varied(
             logits,
             &mut self.graph_state.buffers,
@@ -604,7 +605,7 @@ impl SingleGpuBackend {
 impl TpSchedulerBackend {
     pub(super) fn alloc_prefill_state(
         &mut self,
-        req: &SchedulerRequest,
+        req: &Request,
     ) -> Result<(PrefillBackendState, usize), AdmissionError> {
         let request_id = self.alloc_request_id();
         let cached_tokens = self
@@ -620,7 +621,7 @@ impl TpSchedulerBackend {
         Ok((PrefillBackendState::Tp { request_id }, cached_tokens))
     }
 
-    pub(super) fn active_joint_prefix_pages(&self, req: &SchedulerRequest) -> usize {
+    pub(super) fn active_joint_prefix_pages(&self, req: &Request) -> usize {
         self.executor
             .active_joint_prefix_pages(&req.prompt_tokens, req.lora_adapter.as_deref())
     }
@@ -784,7 +785,7 @@ impl SchedulerBackend {
         }
     }
 
-    pub(super) fn active_joint_prefix_pages(&self, req: &SchedulerRequest) -> usize {
+    pub(super) fn active_joint_prefix_pages(&self, req: &Request) -> usize {
         match self {
             Self::Single(backend) => backend.active_joint_prefix_pages(req),
             Self::Tp(backend) => backend.active_joint_prefix_pages(req),
@@ -840,7 +841,7 @@ impl SchedulerBackend {
 
     pub(super) fn alloc_prefill_state(
         &mut self,
-        req: &SchedulerRequest,
+        req: &Request,
     ) -> Result<(PrefillBackendState, usize), AdmissionError> {
         match self {
             Self::Single(backend) => backend.alloc_prefill_state(req),
