@@ -120,8 +120,8 @@ fn default_markov_head_type() -> String {
     "vanilla".to_string()
 }
 
-/// On-disk drafter config tolerant of both the nested (`b16`) and flat
-/// (DeepSpec) schemas; `from_file` resolves it into `DFlashConfig`.
+/// Backbone geometry shared by flat configs and Speculators
+/// `transformer_layer_config`.
 #[derive(Deserialize)]
 struct DFlashGeometry {
     hidden_size: usize,
@@ -637,4 +637,65 @@ pub(crate) fn probe_config_json(json: &Value) -> Result<()> {
         "Qwen3 architectures must contain Qwen3ForCausalLM"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dflash_selector_fields_parse_from_flat_and_nested_configs() -> Result<()> {
+        let geometry = serde_json::json!({
+            "hidden_size": 4, "intermediate_size": 8, "num_hidden_layers": 2,
+            "num_attention_heads": 1, "num_key_value_heads": 1, "head_dim": 4,
+            "vocab_size": 16, "rms_norm_eps": 1e-6, "rope_theta": 10000.0
+        });
+        let selector = serde_json::json!({
+            "block_size": 3, "mask_token_id": 7, "target_layer_ids": [1, 5],
+            "selector_rank": 2, "selector_top_k": 16,
+            "training_metadata": { "unused": true }
+        });
+        let mut flat = geometry.clone();
+        flat.as_object_mut()
+            .unwrap()
+            .extend(selector.as_object().unwrap().clone());
+        let mut nested = geometry;
+        nested["dflash_config"] = selector;
+        let directory = tempfile::tempdir()?;
+
+        for json in [flat, nested] {
+            fs::write(directory.path().join("config.json"), json.to_string())?;
+            let config = DFlashConfig::from_file(directory.path().to_str().unwrap())?;
+            assert_eq!(config.block_size, 3);
+            assert_eq!(config.mask_token_id, 7);
+            assert_eq!(config.target_layer_ids, vec![1, 5]);
+            assert_eq!(config.selector_rank, 2);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn speculators_dflash_maps_hidden_state_indices_to_decoder_layers() -> Result<()> {
+        let json = serde_json::json!({
+            "transformer_layer_config": {
+                "hidden_size": 4, "intermediate_size": 8, "num_hidden_layers": 2,
+                "num_attention_heads": 1, "num_key_value_heads": 1, "head_dim": 4,
+                "vocab_size": 16, "rms_norm_eps": 1e-6, "rope_theta": 10000.0,
+                "sliding_window": 2048
+            },
+            "block_size": 3, "mask_token_id": 7, "selector_rank": 2,
+            "conv_kernel_size": 2, "conv_group_size": 2,
+            "aux_hidden_state_layer_ids": [1, 3], "sliding_window_non_causal": true
+        });
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("config.json"), json.to_string())?;
+        let config = DFlashConfig::from_file(directory.path().to_str().unwrap())?;
+
+        assert_eq!(config.target_layer_ids, vec![0, 2]);
+        assert_eq!(config.selector_rank, 2);
+        let conv = config.conv.expect("native convolution config");
+        assert_eq!((conv.taps, conv.group_size), (2, 2));
+        assert_eq!(config.sliding_window, Some(2048));
+        Ok(())
+    }
 }

@@ -16,15 +16,10 @@ use pegainfer_kernels::ops::gemm_bf16_f32;
 use crate::config::DFlashConfig;
 use crate::sizing;
 
-// Pack a draft block per launch, capped to bound full-vocabulary keys.
-// CUB still reuses one row's workspace.
-const MAX_PACK_ROWS: usize = 16;
-
 pub(super) struct SelectorHead {
     pub(super) projection: DeviceMatrix,
     pub(super) predecessor: DeviceMatrix,
     pub(super) successor: DeviceMatrix,
-    pub(super) enabled: bool,
 }
 
 pub(super) struct SelectorScratch {
@@ -42,11 +37,7 @@ struct SelectorBuffers {
 }
 
 impl SelectorHead {
-    pub(super) fn reservation_bytes(
-        ctx: &DeviceContext,
-        config: &DFlashConfig,
-        batch: usize,
-    ) -> Result<usize> {
+    pub(super) fn reservation_bytes(config: &DFlashConfig, batch: usize) -> Result<usize> {
         let rank = config.selector_rank;
         if rank == 0 {
             return Ok(0);
@@ -63,14 +54,7 @@ impl SelectorHead {
             weights,
             sizing::product(&[batch, config.block_size, rank, 6])?,
             sizing::product(&[batch, 4])?,
-            DFlash2Scratch::reservation_bytes(
-                ctx,
-                batch,
-                config.block_size,
-                config.vocab_size,
-                rank,
-                MAX_PACK_ROWS.min(config.block_size.saturating_sub(1)),
-            )?,
+            DFlash2Scratch::reservation_bytes(batch, config.block_size, config.vocab_size, rank)?,
         ])
     }
 
@@ -184,7 +168,6 @@ impl SelectorScratch {
                     config.block_size,
                     config.vocab_size,
                     config.selector_rank,
-                    MAX_PACK_ROWS.min(config.block_size.saturating_sub(1)),
                 )?,
             },
         })

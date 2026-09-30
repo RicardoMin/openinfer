@@ -1,4 +1,4 @@
-//! DFlash2's strict candidate lattice; request sampling remains in pegainfer-sample.
+//! DFlash2's candidate lattice; request sampling remains in pegainfer-sample.
 
 use std::ffi::CStr;
 use std::sync::Arc;
@@ -9,8 +9,10 @@ use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use cudarc::driver::DevicePtr;
 use cudarc::driver::DevicePtrMut;
+use half::bf16;
 
 use crate::ffi;
+use crate::ops::sampling::flashinfer_top1_row_states_bytes;
 use crate::tensor::DeviceContext;
 use crate::tensor::DeviceMatrix;
 use crate::tensor::HiddenStates;
@@ -19,24 +21,23 @@ use crate::tensor::has_stream_override;
 
 pub const DFLASH2_CANDIDATE_K: usize = 16;
 
-/// Fixed-capacity, stream-local scratch. Keys are packed in fixed-size row chunks;
-/// CUB selects and orders only 16 candidates per row. Partial chunks have
-/// deterministic padding and never read input row 0.
-/// All allocation and CUB workspace queries occur in `new`, outside capture.
+/// Fixed-capacity, stream-local scratch. Non-anchor logits are compacted into
+/// BF16 rows for one batched FlashInfer radix selection. Tied boundary membership
+/// is repeatable on a fixed input and system, without a smallest-token-ID rule.
+/// All allocation occurs in `new`, outside capture.
 ///
 /// The output accessors expose capacity-sized buffers. Only `active_batch *
-/// (block_size - 1)` rows belong to the latest selection. An error flag must be
-/// collected with the path before any token is submitted to a verifier.
+/// (block_size - 1)` rows belong to the latest selection. Invalid inputs poison
+/// the active path with `u32::MAX`; reject that path before submitting tokens
+/// and read `error_flag()` for details.
 pub struct DFlash2Scratch {
     max_batch: usize,
     block_size: usize,
     vocab: usize,
     rank: usize,
-    rows_per_chunk: usize,
-
-    keys_in: CudaSlice<u64>,
-    keys_out: CudaSlice<u64>,
-    topk_workspace: CudaSlice<u8>,
+    compact_logits: CudaSlice<bf16>,
+    topk_values: CudaSlice<bf16>,
+    row_states: CudaSlice<u8>,
 
     candidate_ids: CudaSlice<u32>,
     unary_scores: CudaSlice<f32>,
@@ -75,37 +76,18 @@ fn check_ffi(status: i32, stage: &str) -> Result<()> {
 }
 
 impl DFlash2Scratch {
-    fn workspace_bytes(ctx: &DeviceContext, vocab: usize) -> Result<usize> {
-        ensure!(
-            vocab >= DFLASH2_CANDIDATE_K && i32::try_from(vocab).is_ok(),
-            "DFlash2 vocab must be in 16..=i32::MAX, got {vocab}"
-        );
-        let mut bytes = 0;
-        let status = unsafe {
-            ffi::dflash2_topk_workspace_bytes_cuda(
-                vocab as i32,
-                &raw mut bytes,
-                active_cu_stream(ctx),
-            )
-        };
-        check_ffi(status, "CUB workspace query")?;
-        Ok(bytes)
-    }
-
     pub fn reservation_bytes(
-        ctx: &DeviceContext,
         batch: usize,
         block: usize,
         vocab: usize,
         rank: usize,
-        chunk: usize,
     ) -> Result<usize> {
         ensure!(block >= 2, "DFlash2 block must contain a draft position");
         let rows = product(&[batch, block - 1])?;
         let sizes = [
-            product(&[chunk, vocab, 8])?,
-            product(&[chunk, DFLASH2_CANDIDATE_K, 8])?,
-            Self::workspace_bytes(ctx, vocab)?,
+            product(&[rows, vocab, 2])?,
+            product(&[rows, DFLASH2_CANDIDATE_K, 2])?,
+            flashinfer_top1_row_states_bytes(),
             product(&[rows, DFLASH2_CANDIDATE_K, 8])?,
             product(&[rows, DFLASH2_CANDIDATE_K, rank, 8])?,
             product(&[rows, DFLASH2_CANDIDATE_K, DFLASH2_CANDIDATE_K, 4])?,
@@ -124,7 +106,6 @@ impl DFlash2Scratch {
         block_size: usize,
         vocab: usize,
         rank: usize,
-        rows_per_chunk: usize,
     ) -> Result<Self> {
         ensure!(
             !has_stream_override(),
@@ -138,6 +119,10 @@ impl DFlash2Scratch {
             i32::try_from(rank).is_ok(),
             "DFlash2 rank exceeds cuBLAS int32"
         );
+        ensure!(
+            vocab >= DFLASH2_CANDIDATE_K && i32::try_from(vocab).is_ok(),
+            "DFlash2 vocab must be in 16..=i32::MAX, got {vocab}"
+        );
 
         let input_rows = product(&[max_batch, block_size])?;
         ensure!(
@@ -146,30 +131,21 @@ impl DFlash2Scratch {
         );
 
         let rows = product(&[max_batch, block_size - 1])?;
-        ensure!(
-            rows_per_chunk > 0 && rows_per_chunk <= rows,
-            "DFlash2 packing chunk must be in 1..={rows}, got {rows_per_chunk}"
-        );
-
-        let keys = product(&[rows_per_chunk, vocab])?;
-        let chunk_candidates = product(&[rows_per_chunk, DFLASH2_CANDIDATE_K])?;
+        let compact_elements = product(&[rows, vocab])?;
         let candidates = product(&[rows, DFLASH2_CANDIDATE_K])?;
         let gathered = product(&[candidates, rank])?;
         let edges = product(&[candidates, DFLASH2_CANDIDATE_K])?;
 
-        let workspace_bytes = Self::workspace_bytes(ctx, vocab)?;
-
-        // TopK reuses one row's library scratch; only the packed input retains
-        // full vocabulary width. Caller separately owns H/W/A/B.
+        // The radix state uses the same sizing contract as the existing top-1
+        // sampler. Caller separately owns H/W/A/B.
         Ok(Self {
             max_batch,
             block_size,
             vocab,
             rank,
-            rows_per_chunk,
-            keys_in: ctx.stream.alloc_zeros(keys)?,
-            keys_out: ctx.stream.alloc_zeros(chunk_candidates)?,
-            topk_workspace: ctx.stream.alloc_zeros(workspace_bytes)?,
+            compact_logits: ctx.stream.alloc_zeros(compact_elements)?,
+            topk_values: ctx.stream.alloc_zeros(candidates)?,
+            row_states: ctx.stream.alloc_zeros(flashinfer_top1_row_states_bytes())?,
             candidate_ids: ctx.stream.alloc_zeros(candidates)?,
             unary_scores: ctx.stream.alloc_zeros(candidates)?,
             gated_predecessors: ctx.stream.alloc_zeros(gathered)?,
@@ -298,10 +274,9 @@ pub fn dflash2_select_into(
         let (gated_ptr, _gg) = scratch.gated_predecessors.device_ptr_mut(&ctx.stream);
         let (successors_ptr, _gss) = scratch.successors.device_ptr_mut(&ctx.stream);
         let (error_ptr, _ge) = scratch.error_flag.device_ptr_mut(&ctx.stream);
-        let (keys_in_ptr, _gki) = scratch.keys_in.device_ptr_mut(&ctx.stream);
-        let (keys_out_ptr, _gko) = scratch.keys_out.device_ptr_mut(&ctx.stream);
-        let workspace_bytes = scratch.topk_workspace.len();
-        let (workspace_ptr, _gw) = scratch.topk_workspace.device_ptr_mut(&ctx.stream);
+        let (compact_ptr, _gc) = scratch.compact_logits.device_ptr_mut(&ctx.stream);
+        let (topk_values_ptr, _gt) = scratch.topk_values.device_ptr_mut(&ctx.stream);
+        let (row_states_ptr, _gr) = scratch.row_states.device_ptr_mut(&ctx.stream);
 
         let status = unsafe {
             ffi::dflash2_prepare_cuda(
@@ -315,15 +290,13 @@ pub fn dflash2_select_into(
                 gated_ptr as *mut f32,
                 successors_ptr as *mut f32,
                 error_ptr as *mut u32,
-                keys_in_ptr as *mut u64,
-                keys_out_ptr as *mut u64,
-                workspace_ptr as *mut std::ffi::c_void,
-                workspace_bytes,
+                compact_ptr as *mut ffi::Half,
+                topk_values_ptr as *mut ffi::Half,
+                row_states_ptr as *mut u8,
                 active_batch as i32,
                 scratch.block_size as i32,
                 scratch.vocab as i32,
                 scratch.rank as i32,
-                scratch.rows_per_chunk as i32,
                 active_cu_stream(ctx),
             )
         };

@@ -14,31 +14,7 @@ fn projection_and_graph_replay_match_scalar_selection() -> Result<()> {
         "target_layer_ids": [0], "selector_rank": 2
     });
     std::fs::write(directory.path().join("config.json"), config.to_string())?;
-    let flat = DFlashConfig::from_file(directory.path().to_str().unwrap())?;
-    let native = serde_json::json!({
-        "transformer_layer_config": config,
-        "block_size": 3, "mask_token_id": 0, "selector_rank": 2,
-        "conv_kernel_size": 2, "conv_group_size": 2,
-        "aux_hidden_state_layer_ids": [1], "sliding_window_non_causal": true
-    });
-    std::fs::write(directory.path().join("config.json"), native.to_string())?;
-    let parsed = DFlashConfig::from_file(directory.path().to_str().unwrap())?;
-    assert_eq!(parsed.target_layer_ids, vec![0], "HF hidden-state indexing");
-    assert_eq!(parsed.selector_rank, flat.selector_rank);
-    assert!(parsed.conv.is_some());
-    let mut nested = config;
-    nested["dflash_config"] = serde_json::json!({
-        "block_size": nested.as_object_mut().unwrap().remove("block_size"),
-        "mask_token_id": nested.as_object_mut().unwrap().remove("mask_token_id"),
-        "target_layer_ids": nested.as_object_mut().unwrap().remove("target_layer_ids"),
-        "selector_rank": nested.as_object_mut().unwrap().remove("selector_rank"),
-        "selector_top_k": 16,
-        "training_metadata": { "unused": true }
-    });
-    std::fs::write(directory.path().join("config.json"), nested.to_string())?;
     let config = DFlashConfig::from_file(directory.path().to_str().unwrap())?;
-    assert_eq!(config.selector_rank, flat.selector_rank);
-    assert_eq!(config.block_size, flat.block_size);
 
     let projection_weights: Vec<_> = (0..8)
         .map(|i| bf16::from_f32((i as f32 - 3.0) / 8.0))
@@ -53,7 +29,6 @@ fn projection_and_graph_replay_match_scalar_selection() -> Result<()> {
         projection: DeviceMatrix::from_host(&ctx, &projection_weights, 2, 4)?,
         predecessor: DeviceMatrix::from_host(&ctx, &predecessor, 16, 2)?,
         successor: DeviceMatrix::from_host(&ctx, &successor, 16, 2)?,
-        enabled: true,
     };
     let mut scratch = SelectorScratch::new(&ctx, &config, 2)?;
     let mut hidden = HiddenStates::zeros(&ctx, 4, 6)?;
