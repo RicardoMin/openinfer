@@ -136,54 +136,58 @@ impl DFlashDraftModel {
             });
         }
 
-        let convs = config
-            .conv
-            .as_ref()
-            .map(|conv| -> Result<Vec<LayerConvs>> {
-                let load = |layer: usize, name: &str| -> Result<GroupedConv> {
+        let (convs, embed_tokens, lm_head) = if let Some(conv) = &config.conv {
+            let mut loader = StagedWeightLoader::new(ctx, &shards, &weight_map)?;
+            let width = 2 * conv.taps * (config.hidden_size / conv.group_size);
+            let mut kernels = Vec::with_capacity(config.num_hidden_layers);
+            for layer in 0..config.num_hidden_layers {
+                let mut load = |name: &str| -> Result<_> {
                     let prefix = format!("layers.{layer}.{name}");
-                    Ok(GroupedConv {
-                        projection: load_tensor_2d(
-                            ctx,
-                            &shards,
-                            &weight_map,
+                    Ok((
+                        loader.matrix(
                             &format!("{prefix}.kernel_projection.weight"),
+                            width,
+                            config.hidden_size,
                         )?,
                         // The kernel views the flat buffer as [2, taps, hidden].
-                        base: load_tensor_1d(
+                        load_tensor_1d(
                             ctx,
                             &shards,
                             &weight_map,
                             &format!("{prefix}.base_kernel"),
                         )?,
-                        block_size: config.block_size,
-                        group_size: conv.group_size,
-                    })
+                    ))
                 };
-                (0..config.num_hidden_layers)
-                    .map(|layer| {
-                        Ok(LayerConvs {
-                            attention: load(layer, "attention_conv")?,
-                            mlp: load(layer, "mlp_conv")?,
-                        })
-                    })
-                    .collect()
-            })
-            .transpose()?;
-        // The supported Speculators checkpoints carry untied embedding and
-        // output-head weights; reusing the target's would change the model.
-        let (embed_tokens, lm_head) = if config.conv.is_some() {
+                kernels.push((load("attention_conv")?, load("mlp_conv")?));
+            }
+
+            // The supported Speculators checkpoints carry untied embedding and
+            // output-head weights; reusing the target's would change the model.
+            let embed =
+                loader.matrix("embed_tokens.weight", config.vocab_size, config.hidden_size)?;
+            let head = loader.matrix("lm_head.weight", config.vocab_size, config.hidden_size)?;
+            loader.finish()?;
+
+            let mut take = |(projection, base)| GroupedConv {
+                projection: loader.take(projection),
+                base,
+                block_size: config.block_size,
+                group_size: conv.group_size,
+            };
+            let layers = kernels
+                .into_iter()
+                .map(|(attention, mlp)| LayerConvs {
+                    attention: take(attention),
+                    mlp: take(mlp),
+                })
+                .collect();
             (
-                Some(load_tensor_2d(
-                    ctx,
-                    &shards,
-                    &weight_map,
-                    "embed_tokens.weight",
-                )?),
-                Some(load_tensor_2d(ctx, &shards, &weight_map, "lm_head.weight")?),
+                Some(layers),
+                Some(loader.take(embed)),
+                Some(loader.take(head)),
             )
         } else {
-            (None, None)
+            (None, None, None)
         };
 
         let norm = load_tensor_1d(ctx, &shards, &weight_map, "norm.weight")?;
