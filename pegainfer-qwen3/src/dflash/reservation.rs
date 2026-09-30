@@ -1,5 +1,4 @@
 use anyhow::Result;
-use pegainfer_core::tensor::DeviceContext;
 
 use super::selector::SelectorHead;
 use crate::config::DFlashConfig;
@@ -38,7 +37,6 @@ pub(crate) struct DFlashMemoryReservation {
 
 impl DFlashMemoryReservation {
     pub(crate) fn from_path(
-        ctx: &DeviceContext,
         draft_path: &str,
         logits_rows: usize,
         max_decode_batch_size: usize,
@@ -46,7 +44,7 @@ impl DFlashMemoryReservation {
         let mut config = DFlashConfig::from_file(draft_path)?;
         config.logits_rows = logits_rows;
         let mut reservation = Self::backbone_from_config(&config, max_decode_batch_size)?;
-        let selector = SelectorHead::reservation_bytes(ctx, &config, max_decode_batch_size)?;
+        let selector = SelectorHead::reservation_bytes(&config, max_decode_batch_size)?;
         reservation.fixed_bytes = sizing::sum(&[reservation.fixed_bytes, selector])?;
         Ok(reservation)
     }

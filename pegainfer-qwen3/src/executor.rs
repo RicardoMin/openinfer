@@ -1267,7 +1267,6 @@ impl Qwen3Executor {
             let (dflash_kv_bytes_per_token, hedge_scratch_pages) = match dflash_draft_path {
                 Some(path) => {
                     let reservation = crate::dflash::DFlashMemoryReservation::from_path(
-                        model.device_ctx(),
                         path,
                         model.config().logits_rows,
                         max_verify_batch,
