@@ -54,6 +54,26 @@ pub(crate) fn request(
     }
 }
 
+// Cancel on scope exit or assertion failure before the harness joins the scheduler.
+pub(crate) struct RequestGuard(RequestControl);
+
+#[allow(dead_code)]
+impl RequestGuard {
+    pub(crate) fn id(&self) -> RequestId {
+        self.0.id()
+    }
+
+    pub(crate) fn abort(&self) {
+        self.0.abort();
+    }
+}
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 #[allow(dead_code)]
 pub(crate) struct EngineHarness {
     handle: Option<SchedulerHandle>,
@@ -78,8 +98,8 @@ impl EngineHarness {
         }
     }
 
-    pub(crate) fn submit(&self, request: Request) -> RequestControl {
-        self.handle.as_ref().unwrap().submit(request)
+    pub(crate) fn submit(&self, request: Request) -> RequestGuard {
+        RequestGuard(self.handle.as_ref().unwrap().submit(request))
     }
 
     pub(crate) fn metrics(&self) -> SchedulerMetrics {

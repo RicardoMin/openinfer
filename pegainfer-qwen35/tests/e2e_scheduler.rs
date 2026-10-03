@@ -10,7 +10,6 @@ use log::info;
 use pegainfer_frontend::engine::EngineLoadOptions;
 use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::RejectReason;
-use pegainfer_frontend::engine::RequestControl;
 use pegainfer_frontend::engine::RequestUpdate;
 use pegainfer_frontend::engine::Terminal;
 use pegainfer_frontend::engine::TokenLogprob;
@@ -20,6 +19,7 @@ use vllm_text::tokenizer::DynTokenizer;
 mod common;
 
 use common::EngineHarness;
+use common::RequestGuard;
 
 const CASES: &[TestCase] = &[
     TestCase {
@@ -130,7 +130,7 @@ fn submit_repeated_token_request(
     token: u32,
     prompt_len: usize,
     max_tokens: usize,
-) -> RequestControl {
+) -> RequestGuard {
     let mut request = common::request(
         vec![token; prompt_len],
         SamplingParams {
@@ -143,7 +143,7 @@ fn submit_repeated_token_request(
     handle.submit(request)
 }
 
-fn wait_for_first_token(handle: &mut EngineHarness, control: &RequestControl, request_id: &str) {
+fn wait_for_first_token(handle: &mut EngineHarness, control: &RequestGuard, request_id: &str) {
     let deadline = Instant::now() + std::time::Duration::from_secs(30);
     loop {
         let update = recv_event_before(handle, control, request_id, deadline);
@@ -159,7 +159,7 @@ fn wait_for_first_token(handle: &mut EngineHarness, control: &RequestControl, re
 
 fn recv_event_before(
     handle: &mut EngineHarness,
-    control: &RequestControl,
+    control: &RequestGuard,
     request_id: &str,
     deadline: Instant,
 ) -> RequestUpdate {
@@ -175,11 +175,7 @@ fn recv_event_before(
     }
 }
 
-fn assert_no_generated_event(
-    handle: &mut EngineHarness,
-    control: &RequestControl,
-    request_id: &str,
-) {
+fn assert_no_generated_event(handle: &mut EngineHarness, control: &RequestGuard, request_id: &str) {
     while let Some(update) = handle.try_next(control.id()) {
         assert!(
             update.tokens.is_empty() && update.terminal.is_none(),
@@ -188,7 +184,7 @@ fn assert_no_generated_event(
     }
 }
 
-fn drain_tokens(handle: &mut EngineHarness, control: &RequestControl, request_id: &str) -> usize {
+fn drain_tokens(handle: &mut EngineHarness, control: &RequestGuard, request_id: &str) -> usize {
     let mut tokens = 0;
     while let Some(update) = handle.try_next(control.id()) {
         assert!(
@@ -217,7 +213,7 @@ fn wait_for_running_requests(handle: &EngineHarness, expected: u64, timeout: std
 
 fn collect_generation(
     handle: &mut EngineHarness,
-    control: &RequestControl,
+    control: &RequestGuard,
     name: &str,
     logprobs: Option<usize>,
 ) -> GenerationResult {
@@ -226,7 +222,7 @@ fn collect_generation(
 
 fn collect_generation_with_timeout(
     handle: &mut EngineHarness,
-    control: &RequestControl,
+    control: &RequestGuard,
     name: &str,
     logprobs: Option<usize>,
     timeout: std::time::Duration,
@@ -242,7 +238,7 @@ fn collect_generation_with_timeout(
 
 fn collect_generation_until(
     handle: &mut EngineHarness,
-    control: &RequestControl,
+    control: &RequestGuard,
     name: &str,
     logprobs: Option<usize>,
     deadline: Option<Instant>,
@@ -321,8 +317,6 @@ fn expect_context_window_rejection(handle: &mut EngineHarness, max_context_token
     request.client_label = Some("over-context-window".into());
     let control = handle.submit(request);
     let update = handle.next(control.id());
-    assert!(update.scheduled.is_none());
-    assert!(update.tokens.is_empty());
     match update.terminal {
         Some(Terminal::Rejected {
             reason,

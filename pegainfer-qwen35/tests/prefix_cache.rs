@@ -7,7 +7,6 @@
 use std::path::Path;
 
 use pegainfer_frontend::engine::FinishReason;
-use pegainfer_frontend::engine::RequestControl;
 use pegainfer_frontend::engine::Terminal;
 use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::sampler::SamplingParams;
@@ -17,6 +16,7 @@ use pegainfer_qwen35::Qwen35SchedulerPolicy;
 mod common;
 
 use common::EngineHarness;
+use common::RequestGuard;
 
 const PREFIX_BOUNDARY: usize = 256;
 const PROMPT_TOKENS: usize = 320;
@@ -61,7 +61,7 @@ fn submit(
     prompt_tokens: Vec<u32>,
     max_tokens: usize,
     logprobs: usize,
-) -> RequestControl {
+) -> RequestGuard {
     let mut request = common::request(
         prompt_tokens,
         SamplingParams {

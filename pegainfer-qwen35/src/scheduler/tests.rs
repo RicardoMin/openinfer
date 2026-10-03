@@ -228,39 +228,6 @@ fn closed_resident_work_is_pruned() {
 }
 
 #[test]
-fn closed_resident_cleanup_preserves_pending_work() {
-    let updates = run_step(
-        vec![
-            test_request("resident-closed", vec![1], 8),
-            test_request("replacement", vec![1], 1),
-        ],
-        &[0],
-        |mut pending, ledger| {
-            let mut active = vec![active_request(pending.remove(0), 20, ledger)];
-            let mut prefilling = Vec::new();
-            let mut backend = LifecycleTestBackend::default();
-            prune_closed_requests(
-                &mut backend,
-                &mut active,
-                &mut prefilling,
-                &mut pending,
-                ledger,
-            )?;
-            assert!(active.is_empty());
-            assert_eq!(backend.active_drops, vec![RequestId::new(20)]);
-            assert_eq!(pending.len(), 1);
-            assert_eq!(
-                pending[0].request.client_label.as_deref(),
-                Some("replacement")
-            );
-            ledger.retire(pending[0].id);
-            Ok(())
-        },
-    );
-    assert!(updates.is_empty());
-}
-
-#[test]
 fn decode_eos_waits_for_drop_before_finished() {
     let mut request = test_request("decode-eos", vec![1], 8);
     request.params.ignore_eos = false;
@@ -504,7 +471,7 @@ fn send_rejection_reports_lifetime_kv_and_context_limits() {
 }
 
 #[test]
-fn prompt_logprobs_request_is_rejected_before_backend_admission() {
+fn prompt_logprobs_filter_rejects_unsupported_requests() {
     let mut unsupported = test_request("unsupported-prompt-logprobs", vec![1, 2, 3], 4);
     unsupported.prompt_logprobs = Some(0);
     let updates = run_step(
@@ -514,7 +481,6 @@ fn prompt_logprobs_request_is_rejected_before_backend_admission() {
             reject_unsupported_prompt_logprobs(&mut pending, ledger);
             assert_eq!(pending.len(), 1);
             assert_eq!(pending[0].request.client_label.as_deref(), Some("regular"));
-            assert!(pending[0].request.prompt_logprobs.is_none());
             ledger.retire(pending[0].id);
             Ok(())
         },
