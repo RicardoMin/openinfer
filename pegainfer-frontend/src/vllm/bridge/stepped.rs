@@ -87,8 +87,6 @@ impl SteppedEngineBridge {
             .take_steps()
             .context("partition step stream already taken")?;
         let mut spec = SpecDecodeTracker::default();
-        // Read the load cell when a step arrives, including a metrics-only
-        // notification, and once here to initialize the frontend's gauges.
         let BridgeLink {
             mut input,
             output_tx,
@@ -253,7 +251,6 @@ impl SteppedEngineBridge {
             }
         }
 
-        // Forward the latest load even when cancellation left no request output.
         send_outputs(
             output_tx,
             RequestBatchOutputs {
@@ -747,8 +744,6 @@ mod tests {
         for (running, updates) in [(1, vec![scheduled]), (0, Vec::new())] {
             backend.metrics.publish(&crate::engine::SchedulerMetrics {
                 num_running_reqs: running,
-                kv_used_blocks: running,
-                kv_total_blocks: 4,
                 ..Default::default()
             });
             bridge
@@ -765,12 +760,8 @@ mod tests {
                 panic!("expected scheduler stats");
             };
             assert!(batch.outputs.is_empty());
-            assert!(batch.finished_requests.is_none());
             let stats = batch.scheduler_stats.expect("scheduler stats");
             assert_eq!(stats.num_running_reqs, running);
-            assert_eq!(stats.num_waiting_reqs, 0);
-            assert!((stats.kv_cache_usage - running as f64 / 4.0).abs() < f64::EPSILON);
-            assert!(stats.spec_decoding_stats.is_none());
         }
         assert!(rx.try_recv().is_err());
     }

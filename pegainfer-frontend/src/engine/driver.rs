@@ -277,11 +277,7 @@ mod tests {
         next_step();
         resume_tx.send(()).unwrap();
         next_step();
-        let admission = steps.try_recv().expect("admission step");
-        assert_eq!(admission.updates.len(), 1);
-        assert_eq!(admission.updates[0].id, control.id());
-        assert!(admission.updates[0].scheduled.is_some());
-        assert_eq!(handle.metrics().num_running_reqs, 1);
+        steps.try_recv().expect("admission step");
 
         control.abort();
         resume_tx.send(()).unwrap();

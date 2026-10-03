@@ -1,8 +1,8 @@
 # Qwen3.5 TP Implementation
 
-> **TL;DR:** Qwen3.5 TP uses rank-local model state behind one step-contract scheduler, with start-gated mixed execution, ID-aligned results and acknowledged retirement. Decode is batched eager or pre-captured CUDA Graph replay when the decode GQA group is compiled.
+> **TL;DR:** Qwen3.5 TP uses rank-local model state behind one step-contract scheduler, with start-gated mixed execution, ID-aligned results and acknowledged retirement. Decode is batched eager or pre-captured CUDA Graph replay when the decode GQA group is compiled. Remaining TP work: group-6 batch-decode kernels for 27B graphs, perf gates.
 >
-> **Last touched:** 2026-09
+> **Last touched:** 2026-10
 
 ## Runtime ownership
 
@@ -99,14 +99,7 @@ retirement succeeds. In TP this requires all-rank drop acknowledgement, so a
 cleanup failure cannot leak a successful terminal or its final token.
 Remaining open accounts are failed by the shared driver when the scheduler
 returns an engine-fatal error. Poisoned workers are not retried through
-healthy cleanup; backend teardown owns their remaining resources. The final
-zero-load metrics are a display value for a dead engine, not proof of page
-recovery; see [scheduler metrics](load-snapshot.md).
-
-This boundary retains Qwen3.5's legacy EOS suppression and untyped stop
-completion. Request-scoped stop-policy adaptation is separate. Non-null
-`prompt_logprobs` is rejected before capacity admission or backend allocation;
-prompt echo is not supplied by this model line.
+healthy cleanup; backend teardown owns their remaining resources.
 
 ## Joint prefix cache
 
@@ -152,7 +145,7 @@ The tests exercise different ownership boundaries:
   cancellation, lifecycle divergence, disconnected-worker failure, mixed
   execution, full capacity recovery and clean readmission under a fresh ID.
 - Scheduler lifecycle tests cover acknowledged completion, cancellation,
-  request rejection and fatal error fan-out through the ledger.
+  request rejection and cleanup failures.
 - `e2e_scheduler` covers eager and Graph request flow, mixed sampling and
   post-cancellation health. `prefix_cache` covers joint restore and eviction.
 - `hf_golden_gate` checks short/long numeric replay, batched buckets and
@@ -170,11 +163,4 @@ metadata; otherwise it uses the engine fixture. Hand-downloaded HF fixtures
 need a resolvable revision or `PEGAINFER_TEST_MODEL_REVISION`.
 
 Run GPU gates serially to avoid capacity pressure and cuBLASLt tuning
-interference between independent executors. Compile/Clippy checks with the
-`qwen35` feature exercise Triton AOT, but do not replace these real-model
-gates. Correctness results also do not establish throughput: hot-loop
-changes need same-machine HTTP A/B in both eager and Graph modes.
-
-Phase 1, mixed execution, GDR sharding and batched/Graph decode landed in
-successive changes; their execution logs and superseded measurements remain
-in Git history. Graph coverage still excludes group 6.
+interference between independent executors.

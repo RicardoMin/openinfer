@@ -31,6 +31,7 @@ use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::KvCapacity;
 use pegainfer_frontend::engine::LiveScheduler;
 use pegainfer_frontend::engine::QueuedRequest;
+use pegainfer_frontend::engine::RejectReason as EngineRejectReason;
 use pegainfer_frontend::engine::Request;
 use pegainfer_frontend::engine::RequestId as FrontendRequestId;
 use pegainfer_frontend::engine::RequestLedger;
@@ -404,16 +405,20 @@ fn bind_model_thread(model: &Qwen35Model) -> Result<CublasThreadGuard> {
 
 // ── Main loop ───────────────────────────────────────────────────────────
 
-fn logical_load_counts(
-    active: &[ActiveRequest35],
-    prefilling: &[PrefillingRequest35],
-    inflight_prefill_reqs: usize,
-    num_waiting_reqs: usize,
-) -> (u64, u64) {
-    (
-        (active.len() + prefilling.len() + inflight_prefill_reqs) as u64,
-        num_waiting_reqs as u64,
-    )
+fn reject_or_retire(id: FrontendRequestId, reason: EngineRejectReason, ledger: &mut RequestLedger) {
+    if ledger.is_aborted(id) {
+        ledger.retire(id);
+    } else {
+        ledger.reject(id, reason);
+    }
+}
+
+fn fail_or_retire(id: FrontendRequestId, message: impl Into<String>, ledger: &mut RequestLedger) {
+    if ledger.is_aborted(id) {
+        ledger.retire(id);
+    } else {
+        ledger.fail(id, message);
+    }
 }
 
 fn prune_closed_requests<B>(
@@ -453,7 +458,7 @@ where
                 "request pruned before scheduling: request_id={:?} phase=prefill cursor={}",
                 removed.req.request.client_label, removed.cursor
             );
-            // Admission now creates rank-local recurrent state, even on a cold miss.
+            // Admission creates rank-local recurrent state, even on a cold miss.
             let expectation = DropExpectation::MustExist;
             backend.drop_prefill_state(&removed.backend_state, expectation)?;
             ledger.retire(removed.req.id);
@@ -470,16 +475,13 @@ fn reject_unsupported_prompt_logprobs(
         if req.request.prompt_logprobs.is_none() {
             return true;
         }
-        if ledger.is_aborted(req.id) {
-            ledger.retire(req.id);
-        } else {
-            ledger.reject(
-                req.id,
-                pegainfer_frontend::engine::RejectReason::Unsupported {
-                    feature: "prompt_logprobs".to_owned(),
-                },
-            );
-        }
+        reject_or_retire(
+            req.id,
+            EngineRejectReason::Unsupported {
+                feature: "prompt_logprobs".to_owned(),
+            },
+            ledger,
+        );
         false
     });
 }
@@ -493,7 +495,6 @@ struct Qwen35Scheduler {
     rng: StdRng,
     prefill_budget: usize,
     scheduler_policy: Qwen35SchedulerPolicy,
-    // The driver publishes once after a fatal return, before backend teardown.
     failed: bool,
     backend: SchedulerBackend,
 }
@@ -686,11 +687,7 @@ impl Qwen35Scheduler {
                     }
                     Err(AdmissionError::Recoverable(error)) => {
                         warn!("failed to admit new request: {error}");
-                        if ledger.is_aborted(req.id) {
-                            ledger.retire(req.id);
-                        } else {
-                            ledger.fail(req.id, error.to_string());
-                        }
+                        fail_or_retire(req.id, error.to_string(), ledger);
                     }
                     Err(AdmissionError::Fatal(error)) => return Err(error),
                 }
@@ -783,8 +780,7 @@ impl Scheduler for Qwen35Scheduler {
     fn step(&mut self, ledger: &mut RequestLedger) -> Result<()> {
         let result = self.advance(ledger);
         if result.is_err() {
-            // The driver answers every open account after this returns. Drain
-            // the async stream before freeing any of its request allocations.
+            // The driver answers every open account after this returns.
             drop(self.inflight_prefill.take());
             self.active.clear();
             self.prefilling.clear();
@@ -796,14 +792,10 @@ impl Scheduler for Qwen35Scheduler {
 
     fn metrics(&self) -> SchedulerMetrics {
         let kv_total_blocks = self.backend.capacity_pages_for_requests() as u64;
-        let (num_running_reqs, num_waiting_reqs) = logical_load_counts(
-            &self.active,
-            &self.prefilling,
-            self.inflight_prefill
-                .as_ref()
-                .map_or(0, |prefill| prefill.chunk.reqs.len()),
-            self.pending.len(),
-        );
+        let inflight_prefill_reqs = self
+            .inflight_prefill
+            .as_ref()
+            .map_or(0, |prefill| prefill.chunk.reqs.len());
         SchedulerMetrics {
             kv_used_blocks: if self.failed {
                 // TP pages stay owned until backend teardown; zero is display-only.
@@ -812,15 +804,15 @@ impl Scheduler for Qwen35Scheduler {
                 kv_total_blocks.saturating_sub(self.backend.available_pages() as u64)
             },
             kv_total_blocks,
-            num_running_reqs,
-            num_waiting_reqs,
+            num_running_reqs: (self.active.len() + self.prefilling.len() + inflight_prefill_reqs)
+                as u64,
+            num_waiting_reqs: self.pending.len() as u64,
             spec_decode: None,
         }
     }
 }
 
 fn send_rejection(req: &QueuedRequest, reason: RejectReason, ledger: &mut RequestLedger) {
-    use pegainfer_frontend::engine::RejectReason as EngineRejectReason;
     let reason = match reason {
         RejectReason::ZeroMaxTokens => EngineRejectReason::Unsupported {
             feature: "max_tokens=0".to_owned(),
@@ -838,11 +830,7 @@ fn send_rejection(req: &QueuedRequest, reason: RejectReason, ledger: &mut Reques
             ),
         },
     };
-    if ledger.is_aborted(req.id) {
-        ledger.retire(req.id);
-    } else {
-        ledger.reject(req.id, reason);
-    }
+    reject_or_retire(req.id, reason, ledger);
 }
 
 // ── Batch prefill ───────────────────────────────────────────────────────
@@ -1352,21 +1340,13 @@ fn take_prefill_chunks(
 /// Report a forward/sampling failure to every request in the failed chunk.
 fn fail_chunk(chunk: ScheduledChunk, message: &str, ledger: &mut RequestLedger) {
     for req in chunk.reqs {
-        if ledger.is_aborted(req.id) {
-            ledger.retire(req.id);
-        } else {
-            ledger.fail(req.id, message);
-        }
+        fail_or_retire(req.id, message, ledger);
     }
 }
 
 fn fail_active(active: &mut Vec<ActiveRequest35>, message: &str, ledger: &mut RequestLedger) {
     for req in active.drain(..) {
-        if ledger.is_aborted(req.id) {
-            ledger.retire(req.id);
-        } else {
-            ledger.fail(req.id, message);
-        }
+        fail_or_retire(req.id, message, ledger);
     }
 }
 

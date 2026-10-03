@@ -2,7 +2,7 @@
 
 **TL;DR:** `/metrics` exposes request histograms for every model and engine gauges for schedulers that publish load: Qwen3, Qwen3.5 and Gemma 4 use one logical engine, while GLM5.2 EP8/DP8 uses eight rank-local engines and GLM5.2 TP8 uses one logical engine. The bridge forwards each partition's stats under the same identity the vLLM frontend uses for least-load routing.
 
-Last touched: 2026-09
+Last touched: 2026-10
 
 ## How the numbers flow
 
@@ -24,8 +24,6 @@ Historical watch-path measurements found noise-level cost in both covered config
 - Per-GPU FLOPs/bytes estimates, KV-block residency histograms, cudagraph stats — the bridge sends `SchedulerStats::default()` for these fields.
 - Every legacy model crate whose scheduler doesn't publish a `LoadSnapshot` watch (currently deepseek and kimi) gets path 1 only; its engine gauges are absent, not lying-zero — the bridge skips the stats task for that partition when no watch exists.
 
-## Validated coverage and next step
-
-Pre-migration Qwen3.5 single-GPU live RTX 5090 measurements remain in Git history; they predate the step-contract publication boundary and did not cover TP. The current accounting and validation boundaries are described in [Qwen3.5 Scheduler Metrics](../../models/qwen35/load-snapshot.md#validation-boundaries).
+## Next step
 
 Next, wire the DeepSeek-V2-Lite and Kimi-K2 schedulers using the same recipe, and report real prefix-cache query/hit counters instead of zeros. A future partitioned model must expose its logical scheduler partitions instead of averaging them behind engine 0.

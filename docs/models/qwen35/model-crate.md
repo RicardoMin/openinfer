@@ -2,7 +2,7 @@
 
 > **TL;DR:** `pegainfer-qwen35` owns the hybrid model runtime and scheduler; the server launches it through the shared step-contract `Engine`. Qwen3.8 uses the same model line.
 >
-> **Last touched:** 2026-09
+> **Last touched:** 2026-10
 
 ## Ownership and entry points
 
@@ -43,13 +43,12 @@ its scheduler, so that scheduler needs no second startup handshake. See
 [scheduler metrics](load-snapshot.md) for publication, cancellation and idle
 polling.
 
-This migration retains the existing stop behavior: model EOS is suppressed
-unless `ignore_eos` is set, and a stop finishes without a typed cause. The
-bridge supplies its legacy sentinel so HTTP usage still counts suppressed
-EOS; ledger counts cover only emitted tokens. Request-scoped stop IDs and
-retained trigger/logprob metadata remain follow-up work. Qwen3.5 rejects
-non-null `prompt_logprobs` before backend allocation and does not provide
-prompt echo.
+Qwen3.5 suppresses model EOS unless `ignore_eos` is set, and a stop finishes
+without a typed cause. The bridge supplies its legacy sentinel so HTTP usage
+still counts suppressed EOS; ledger counts cover only emitted tokens.
+Request-scoped stop IDs and retained trigger/logprob metadata remain
+follow-up work. Qwen3.5 rejects non-null `prompt_logprobs` before backend
+allocation and does not provide prompt echo.
 
 ## Build and validation
 
@@ -61,12 +60,7 @@ and benches declare their required feature explicitly.
 Use the model crate's scheduler, chunked-prefill, sampling, prefix-cache and
 TP2 serving integration tests for request-flow changes. The HF logits gate
 in [accuracy](accuracy.md) is the numerical oracle; an E2E test completing or
-producing plausible text is not an accuracy measurement. The shared model fixture uses
-`PEGAINFER_TEST_MODEL_PATH`; use an absolute path to avoid
+producing plausible text is not an accuracy measurement. The shared model
+fixture uses `PEGAINFER_TEST_MODEL_PATH`; use an absolute path to avoid
 package working-directory ambiguity. TP2 gates require two devices and must
-run serially. Performance claims need separate HTTP A/B evidence against a
-fixed baseline.
-
-The original crate extraction and retired exact-text gates remain in Git
-history. Current work should extend the model-local entry points and tests
-above rather than restore the former root-level model modules.
+run serially.

@@ -9,7 +9,7 @@
 //! unbounded channels), the step stream is tokio (async consumer in the
 //! protocol stack; the sync producer's send never blocks either), metrics are
 //! a shared cell, with changes signaled on the step stream (see
-//! [`MetricsPublisher`]).
+//! [`super::StepOutputs`]).
 //!
 //! How many schedulers an engine runs and what each one means (DP replicas,
 //! anything else) is the model line's decision; the contract carries the
@@ -51,9 +51,6 @@ pub struct SchedulerBackend {
 /// Sole writer of a scheduler's metrics cell; the driver publishes once per
 /// iteration from [`super::Scheduler::metrics`].
 ///
-/// The driver reports changes through the step stream, including steps with
-/// no request output. Repeated idle publishes send no notification; consumers
-/// read the latest snapshot through [`SchedulerHandle::metrics`].
 /// A `Mutex` (not per-field atomics) so a reader never sees fields torn
 /// across two steps; both sides touch it uncontended for nanoseconds.
 pub struct MetricsPublisher(Arc<Mutex<SchedulerMetrics>>);

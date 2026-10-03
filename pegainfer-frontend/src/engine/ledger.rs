@@ -339,8 +339,7 @@ impl RequestLedger {
         }
     }
 
-    /// Ship request updates or notify the frontend of changed metrics. Silent
-    /// steps such as cancellation still need to publish their new load.
+    /// Commit the buffered updates as described by [`StepOutputs`].
     pub(crate) fn commit_step(&mut self, metrics_changed: bool) {
         let updates = self.statement.take_updates();
         if updates.is_empty() && !metrics_changed {

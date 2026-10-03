@@ -2,7 +2,7 @@
 
 > **TL;DR:** Single-GPU and TP Qwen3.5 expose one logical scheduler's post-step `SchedulerMetrics` through the shared driver; in-flight prefill counts as running work.
 >
-> **Last touched:** 2026-09
+> **Last touched:** 2026-10
 
 ## Publication boundary
 
@@ -50,31 +50,16 @@ iterations send no step.
 
 ## Waiting and failure
 
-The shared driver polls when idle; unlike the former `blocking_recv` loop,
-this can occupy a CPU thread even without requests. With overlap enabled,
-Qwen3.5 polls the prefill event while decode remains active. If no decoder
-remains, it waits for that event inside the step and then finishes the chunk.
+The shared driver polls when idle and can occupy a CPU thread even without
+requests. With overlap enabled, Qwen3.5 polls the prefill event while decode
+remains active. If no decoder remains, it waits for that event inside the
+step and then finishes the chunk.
 
 On an engine-fatal error, the scheduler drains asynchronous work before
 clearing its request owners. The shared driver fails open ledger accounts
-and exits. The final metrics retain total capacity and display zero running,
-waiting and used KV for the dead engine. That zero is not evidence that TP
-pages were returned: a poisoned executor is not retried through healthy
-`DropRequest` cleanup, and its remaining resources are released during
-backend teardown.
-
-## Validation boundaries
-
-Scheduler lifecycle tests cover cancellation, same-step readmission,
-in-flight work and fatal shutdown. TP resource recovery requires worker-state
-and readmission checks in addition to scheduler metrics; a zero gauge alone
-cannot prove it. HTTP metrics checks must observe load while requests are
-running and after drain or cancellation.
-
-Correctness tests do not establish hot-loop performance. Compare HTTP TTFT,
-TPOT and throughput against the same-machine baseline for single-GPU,
-overlap and TP2 execution, keeping diagnostic tracing separate from timed
-runs; see [benchmark conventions](../../conventions/bench-regression.md).
-
-The original load-watch implementation and its measurements remain in Git
-history; they describe a different publication boundary.
+and exits. The bridge observes the exit and reports the dead engine to the
+frontend, which shuts down the HTTP service. The final metrics retain total
+capacity and display zero running, waiting and used KV for the dead engine.
+That zero is not evidence that TP pages were returned: a poisoned executor
+is not retried through healthy `DropRequest` cleanup, and its remaining
+resources are released during backend teardown.

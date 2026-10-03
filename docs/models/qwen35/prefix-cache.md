@@ -2,7 +2,7 @@
 
 > **TL;DR:** Qwen3.5-4B uses a GPU-only, content-hashed joint prefix cache: full-attention KV is reusable only with a matching complete recurrent/conv snapshot at the same 256-token boundary, otherwise the request is cold. KV stays in kvbm's reclaimable inactive pool, while `SnapshotCache` owns snapshot lookup, pinning, LRU, and publication. TP1/TP2 correctness and serving tests pass, and a 4,160-token shared prefix cuts warm TTFT by 94.3% (TP1) / 95.1% (TP2).
 >
-> **Last touched:** 2026-09
+> **Last touched:** 2026-10
 
 ## Preparation
 
@@ -70,7 +70,7 @@ Joint lookup adds these exact-boundary operations to the shared cache:
 5. Advance the new request's KV position as part of the same attachment.
 6. Keep at least one prompt token uncached so prefill can produce the first generated token.
 
-`TokenEvent::Scheduled.cached_tokens` reports the selected joint boundary. A KV-only tail is never reported as a hit.
+The scheduler records the selected joint boundary with `RequestLedger::set_cached_tokens`; the committed `RequestUpdate.cached_tokens` reports it to the frontend. A KV-only tail is never reported as a hit.
 
 ## Valid cache hit
 

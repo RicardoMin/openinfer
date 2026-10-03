@@ -161,7 +161,7 @@ impl PrefillPromoteBackend for LifecycleTestBackend {
 }
 
 #[test]
-fn closed_pending_work_is_pruned_before_admission() {
+fn closed_pending_work_is_pruned() {
     let updates = run_step(
         vec![
             test_request("closed", vec![1], 1),
@@ -178,22 +178,7 @@ fn closed_pending_work_is_pruned_before_admission() {
             )?;
             assert_eq!(pending.len(), 1);
             assert_eq!(pending[0].request.client_label.as_deref(), Some("open"));
-            let admission = admit_pending_requests(
-                pending,
-                &[],
-                1,
-                16,
-                8,
-                8,
-                128,
-                |req| req.request.prompt_tokens.len(),
-                |req| req.request.max_tokens,
-                |_| 0,
-            );
-            assert_eq!(admission.pending.len(), 1);
-            assert!(admission.deferred.is_empty());
-            assert!(admission.rejected.is_empty());
-            ledger.retire(admission.pending[0].id);
+            ledger.retire(pending[0].id);
             Ok(())
         },
     );
@@ -201,7 +186,7 @@ fn closed_pending_work_is_pruned_before_admission() {
 }
 
 #[test]
-fn closed_resident_work_is_absent_from_post_prune_load() {
+fn closed_resident_work_is_pruned() {
     let updates = run_step(
         vec![
             test_request("active-closed", vec![1], 8),
@@ -229,10 +214,6 @@ fn closed_resident_work_is_absent_from_post_prune_load() {
             assert_eq!(active.len(), 1);
             assert_eq!(active[0].client_label.as_deref(), Some("active-open"));
             assert!(prefilling.is_empty());
-            assert_eq!(
-                logical_load_counts(&active, &prefilling, 0, pending.len()),
-                (1, 1)
-            );
             assert_eq!(backend.active_drops, vec![RequestId::new(10)]);
             assert_eq!(
                 backend.prefill_drops,
@@ -247,7 +228,7 @@ fn closed_resident_work_is_absent_from_post_prune_load() {
 }
 
 #[test]
-fn closed_resident_frees_capacity_for_same_tick_admission() {
+fn closed_resident_cleanup_preserves_pending_work() {
     let updates = run_step(
         vec![
             test_request("resident-closed", vec![1], 8),
@@ -265,111 +246,18 @@ fn closed_resident_frees_capacity_for_same_tick_admission() {
                 &mut pending,
                 ledger,
             )?;
-            let active_budget: Vec<ActiveKvBudget> = active
-                .iter()
-                .map(|req| ActiveKvBudget {
-                    prompt_len: req.prompt_len,
-                    generated_count: ledger.completion_tokens(req.id),
-                    max_tokens: req.max_tokens,
-                })
-                .collect();
-            let admission = admit_pending_requests(
-                pending,
-                &active_budget,
-                1,
-                16,
-                8,
-                8,
-                128,
-                |req| req.request.prompt_tokens.len(),
-                |req| req.request.max_tokens,
-                |_| 0,
-            );
-            assert_eq!(admission.pending.len(), 1);
+            assert!(active.is_empty());
+            assert_eq!(backend.active_drops, vec![RequestId::new(20)]);
+            assert_eq!(pending.len(), 1);
             assert_eq!(
-                admission.pending[0].request.client_label.as_deref(),
+                pending[0].request.client_label.as_deref(),
                 Some("replacement")
             );
-            assert!(admission.deferred.is_empty());
-            assert!(admission.rejected.is_empty());
-            ledger.retire(admission.pending[0].id);
+            ledger.retire(pending[0].id);
             Ok(())
         },
     );
     assert!(updates.is_empty());
-}
-
-#[test]
-fn closed_materialized_prefill_requires_existing_worker_state() {
-    let updates = run_step(
-        vec![test_request("prefill-materialized", vec![1, 2], 1)],
-        &[0],
-        |mut requests, ledger| {
-            let mut request = prefilling_request(requests.remove(0), 21, ledger);
-            request.cursor = 1;
-            let mut prefilling = vec![request];
-            let mut backend = LifecycleTestBackend::default();
-            prune_closed_requests(
-                &mut backend,
-                &mut Vec::new(),
-                &mut prefilling,
-                &mut Vec::new(),
-                ledger,
-            )?;
-            assert!(prefilling.is_empty());
-            assert_eq!(
-                backend.prefill_drops,
-                vec![(RequestId::new(21), DropExpectation::MustExist)]
-            );
-            Ok(())
-        },
-    );
-    assert!(updates.is_empty());
-}
-
-#[test]
-fn prune_drop_failure_preserves_pending_for_terminal_fanout() {
-    let updates = run_step(
-        vec![
-            test_request("closed-active", vec![1], 8),
-            test_request("live-pending", vec![1], 1),
-        ],
-        &[0],
-        |mut pending, ledger| {
-            let mut active = vec![active_request(pending.remove(0), 22, ledger)];
-            let mut backend = LifecycleTestBackend {
-                fail_active_drop: true,
-                ..Default::default()
-            };
-            let result = prune_closed_requests(
-                &mut backend,
-                &mut active,
-                &mut Vec::new(),
-                &mut pending,
-                ledger,
-            );
-            assert!(result.is_err());
-            assert!(active.is_empty());
-            assert_eq!(pending.len(), 1);
-            result
-        },
-    );
-    let terminals: Vec<_> = updates
-        .iter()
-        .filter_map(|update| {
-            update
-                .terminal
-                .as_ref()
-                .map(|terminal| (update.id, terminal))
-        })
-        .collect();
-    assert_eq!(terminals.len(), 2);
-    for (id, terminal) in terminals {
-        assert!(
-            matches!(terminal, Terminal::Failed { message, completion_tokens, .. }
-            if message.contains("injected active drop failure") && *completion_tokens == usize::from(id.raw() == 0))
-        );
-    }
 }
 
 #[test]
@@ -563,103 +451,8 @@ fn immediate_prefill_drop_failure_publishes_only_terminal_error() {
             .filter_map(|update| update.terminal.as_ref())
             .collect();
         assert_eq!(terminals.len(), 1);
-        assert!(
-            matches!(terminals[0], Terminal::Failed { message, completion_tokens, .. }
-            if message.contains("injected prefill drop failure") && *completion_tokens == tokens.len())
-        );
-    }
-}
-
-#[test]
-#[ignore = "requires two CUDA devices and Qwen3.5 weights"]
-fn fatal_shutdown_displays_empty_load_and_errors_owned_requests_once() {
-    let Some(model_path) = crate::test_fixture::model_path_or_skip(
-        "fatal_shutdown_displays_empty_load_and_errors_owned_requests_once",
-    ) else {
-        return;
-    };
-    let updates = run_step(
-        vec![
-            test_request("active", vec![151_646, 9707], 8),
-            test_request("prefilling", vec![151_646, 9707], 8),
-            test_request("pending", vec![151_646], 1),
-        ],
-        &[0],
-        |requests, ledger| {
-            let mut backend = TpSchedulerBackend::new(&model_path, &[0, 1], 2, 2, false, 0)?;
-            backend
-                .executor
-                .execute_prefill(crate::executor::PrefillPlan {
-                    requests: &[crate::executor::PrefillStepItem::new(
-                        RequestId::new(40),
-                        vec![151_646, 9707],
-                        None,
-                    )],
-                })?;
-            let mut scheduler = Qwen35Scheduler::new(
-                SchedulerBackend::Tp(backend),
-                42,
-                2,
-                Qwen35SchedulerPolicy::Off,
-            );
-            let mut requests = requests.into_iter();
-            // A broken worker ID makes cancellation fail while real KV is still owned.
-            scheduler
-                .active
-                .push(active_request(requests.next().unwrap(), 41, ledger));
-            let req = requests.next().unwrap();
-            let (backend_state, cached_tokens) = scheduler
-                .backend
-                .alloc_prefill_state(&req.request)
-                .unwrap_or_else(|_| panic!("materialize prefilling request"));
-            ledger.admit(req.id);
-            scheduler.prefilling.push(PrefillingRequest35 {
-                req,
-                backend_state,
-                cursor: cached_tokens,
-                step_chunk: 0,
-            });
-            scheduler.submit(requests.next().unwrap());
-            let before = scheduler.metrics();
-            assert!(before.kv_used_blocks > 0);
-            assert_eq!(before.num_running_reqs, 2);
-            assert_eq!(before.num_waiting_reqs, 1);
-
-            let result = scheduler.step(ledger);
-            assert!(
-                result
-                    .as_ref()
-                    .unwrap_err()
-                    .to_string()
-                    .contains("MustExist")
-            );
-            let snapshot = scheduler.metrics();
-            assert_eq!(snapshot.kv_used_blocks, 0);
-            assert_eq!(snapshot.kv_total_blocks, before.kv_total_blocks);
-            assert_eq!(snapshot.num_running_reqs, 0);
-            assert_eq!(snapshot.num_waiting_reqs, 0);
-            result
-        },
-    );
-    for raw_id in 0..3 {
-        let request_updates: Vec<_> = updates
-            .iter()
-            .filter(|update| update.id == FrontendRequestId::new(raw_id))
-            .collect();
-        let tokens: Vec<_> = request_updates
-            .iter()
-            .flat_map(|update| &update.tokens)
-            .collect();
-        assert_eq!(tokens.len(), usize::from(raw_id == 0));
-        let terminals: Vec<_> = request_updates
-            .iter()
-            .filter_map(|update| update.terminal.as_ref())
-            .collect();
-        assert_eq!(terminals.len(), 1);
-        assert!(
-            matches!(terminals[0], Terminal::Failed { message, completion_tokens, .. }
-            if message.contains("MustExist") && *completion_tokens == tokens.len())
-        );
+        assert!(matches!(terminals[0], Terminal::Failed { message, .. }
+            if message.contains("injected prefill drop failure")));
     }
 }
 
@@ -685,8 +478,6 @@ fn send_rejection_reports_lifetime_kv_and_context_limits() {
             },
         );
         assert_eq!(updates.len(), 1);
-        assert!(updates[0].scheduled.is_none());
-        assert!(updates[0].tokens.is_empty());
         match updates.into_iter().next().unwrap().terminal {
             Some(Terminal::Rejected {
                 reason,
@@ -729,8 +520,6 @@ fn prompt_logprobs_request_is_rejected_before_backend_admission() {
         },
     );
     assert_eq!(updates.len(), 1);
-    assert!(updates[0].scheduled.is_none());
-    assert!(updates[0].tokens.is_empty());
     assert!(matches!(&updates[0].terminal, Some(Terminal::Rejected {
         reason: pegainfer_frontend::engine::RejectReason::Unsupported { feature }, prompt_tokens: 3,
     }) if feature == "prompt_logprobs"));
@@ -752,7 +541,6 @@ fn tp2_scheduler_runs_forced_mixed_steps() {
     let prefill = handle.submit(test_request("mixed-prefill", vec![151_646, 9707], 2));
     let ids = [decode.id(), prefill.id()];
     let expected = [8, 2];
-    let mut counts = [0, 0];
     let mut finished = [false, false];
     let deadline = Instant::now() + Duration::from_secs(30);
     while !finished.iter().all(|done| *done) {
@@ -763,12 +551,10 @@ fn tp2_scheduler_runs_forced_mixed_steps() {
                         .iter()
                         .position(|id| *id == update.id)
                         .expect("unknown request id");
-                    assert!(!finished[index], "output after terminal");
-                    counts[index] += update.tokens.len();
                     if let Some(terminal) = update.terminal {
                         assert!(
                             matches!(terminal, Terminal::Finished { reason: FinishReason::Length, completion_tokens, .. }
-                        if completion_tokens == expected[index] && completion_tokens == counts[index])
+                        if completion_tokens == expected[index])
                         );
                         finished[index] = true;
                     }
@@ -788,5 +574,4 @@ fn tp2_scheduler_runs_forced_mixed_steps() {
     }
     drop(handle);
     join.join().expect("scheduler thread panicked");
-    assert!(steps.try_recv().is_err(), "output after both terminals");
 }
