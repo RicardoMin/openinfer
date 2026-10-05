@@ -1,6 +1,5 @@
 //! DFlash2's candidate lattice; request sampling remains in pegainfer-sample.
 
-use std::ffi::CStr;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -55,24 +54,6 @@ fn product(values: &[usize]) -> Result<usize> {
             .filter(|&size| isize::try_from(size).is_ok())
             .ok_or_else(|| anyhow!("DFlash2 allocation/shape overflow: {values:?}"))
     })
-}
-
-fn check_ffi(status: i32, stage: &str) -> Result<()> {
-    if status != 0 {
-        // Guarded FFI calls clear the thread-local error on entry and retain it
-        // until the next guarded call; read it immediately on this thread.
-        let message = unsafe {
-            let pointer = ffi::pegainfer_kernels_last_error();
-            if pointer.is_null() {
-                String::new()
-            } else {
-                CStr::from_ptr(pointer).to_string_lossy().into_owned()
-            }
-        };
-        return Err(anyhow!("DFlash2 {stage} failed ({status}): {message}"));
-    }
-
-    Ok(())
 }
 
 impl DFlash2Scratch {
@@ -196,7 +177,6 @@ fn check_stream<T>(ctx: &DeviceContext, buffer: &CudaSlice<T>, name: &str) -> Re
 /// Buffers must use the same base stream: DeviceContext disables cudarc's event
 /// tracking, so a stream override would leave buffer ownership unsynchronized.
 /// An empty batch is a no-op; its caller must not collect stale scratch outputs.
-#[allow(clippy::too_many_arguments)]
 pub fn dflash2_select_into(
     ctx: &DeviceContext,
     logits: &HiddenStates,
@@ -300,7 +280,11 @@ pub fn dflash2_select_into(
                 active_cu_stream(ctx),
             )
         };
-        check_ffi(status, "candidate selection/gather")?;
+        ensure!(
+            status == 0,
+            "DFlash2 candidate selection/gather failed ({status}){}",
+            super::ffi_exception_message(status)
+        );
     }
 
     let rows = active_batch * (scratch.block_size - 1);
@@ -347,7 +331,11 @@ pub fn dflash2_select_into(
                 active_cu_stream(ctx),
             )
         };
-        check_ffi(status, "edge scoring/walk")?;
+        ensure!(
+            status == 0,
+            "DFlash2 edge scoring/walk failed ({status}){}",
+            super::ffi_exception_message(status)
+        );
     }
 
     Ok(())

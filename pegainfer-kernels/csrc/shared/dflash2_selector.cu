@@ -6,7 +6,6 @@
 #include <flashinfer/topk.cuh>
 
 #include <algorithm>
-#include <climits>
 #include <cstdint>
 #include <stdexcept>
 
@@ -23,12 +22,6 @@ constexpr unsigned kNonfiniteScore = 8;
 void check_cuda(cudaError_t status) {
   if (status != cudaSuccess) {
     throw std::runtime_error(cudaGetErrorString(status));
-  }
-}
-
-void require(bool condition, const char* message) {
-  if (!condition) {
-    throw std::invalid_argument(message);
   }
 }
 
@@ -187,6 +180,7 @@ __global__ void walk(const float* edges, const unsigned* ids, unsigned* selected
 
 }  // namespace
 
+// Dimensions and buffer extents are checked by dflash2_select_into.
 extern "C" int dflash2_prepare_cuda(
     const __nv_bfloat16* logits, const __nv_bfloat16* hidden,
     const __nv_bfloat16* predecessor, const __nv_bfloat16* successor,
@@ -195,14 +189,6 @@ extern "C" int dflash2_prepare_cuda(
     __nv_bfloat16* topk_values, uint8_t* row_states, int batch, int block_size,
     int vocab, int rank, cudaStream_t stream) {
   PEGAINFER_FFI_GUARD_BEGIN
-  require(batch > 0 && block_size >= 2 && rank > 0 &&
-              vocab >= kCandidates &&
-              static_cast<int64_t>(batch) * block_size <= INT_MAX,
-          "DFlash2 invalid prepare dimensions");
-  require(logits && hidden && predecessor && successor && anchors && ids && unary &&
-              gated && successors && error && compact && topk_values && row_states,
-          "DFlash2 null prepare pointer");
-
   check_cuda(cudaMemsetAsync(error, 0, sizeof(unsigned), stream));
   const int rows = batch * (block_size - 1);
 
@@ -233,10 +219,6 @@ extern "C" int dflash2_finish_cuda(float* edges, const float* unary,
                                   unsigned* error, int batch, int length,
                                   cudaStream_t stream) {
   PEGAINFER_FFI_GUARD_BEGIN
-  require(batch > 0 && length > 0 && static_cast<int64_t>(batch) * length <= INT_MAX,
-          "DFlash2 invalid finish dimensions");
-  require(edges && unary && ids && selected && error, "DFlash2 null finish pointer");
-
   add_unary<<<blocks(static_cast<int64_t>(batch) * length * kCandidates * kCandidates), 256, 0, stream>>>(
       edges, unary, batch * length, error);
   check_cuda(cudaPeekAtLastError());
