@@ -43,14 +43,9 @@ pub(crate) struct Config {
     pub(crate) stop_token_ids: Vec<u32>,
 }
 
-/// Resolved drafter config shared by DFlash and DSpark. DSpark extends the
-/// DFlash backbone with a Markov head and an optional confidence head;
-/// zero Markov and selector ranks select independent per-position argmax. Supported
-/// schemas are normalized in `from_file`: our `Qwen3-4B-DFlash-b16` nests
-/// `dflash_config: {mask_token_id, target_layer_ids}` and puts `rope_theta` at
-/// the top level, while DeepSpec's `dflash_/dspark_*_block7` put those fields
-/// flat and nest `rope_theta` under `rope_parameters`. Published Speculators
-/// DFlash2 checkpoints nest backbone geometry in `transformer_layer_config`.
+/// Drafter config for DFlash, DSpark and DFlash2. `from_file` normalizes
+/// nested b16, flat DeepSpec and Speculators schemas. With both head ranks
+/// zero, proposals use independent per-position argmax.
 #[derive(Clone, Debug)]
 pub(crate) struct DFlashConfig {
     pub(crate) hidden_size: usize,

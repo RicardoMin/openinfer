@@ -16,7 +16,6 @@ use crate::tensor::active_cu_stream;
 /// Apply one side of the conv pair, using coefficients produced by the shared
 /// GEMM. `dynamic` is `[rows, 2 * taps * groups]`; `base` is `[2, taps, hidden]`.
 /// Pre/post sides reuse the same coefficients computed before the sublayer.
-#[allow(clippy::too_many_arguments)]
 pub fn dflash2_grouped_conv_into(
     ctx: &DeviceContext,
     input: &HiddenStates,

@@ -1,8 +1,8 @@
 #include "common.cuh"
+#include "ffi_guard.cuh"
 
 #include <algorithm>
 #include <cstdint>
-#include <cuda.h>
 
 namespace {
 
@@ -41,18 +41,14 @@ __global__ void grouped_conv_kernel(
 
 }  // namespace
 
+// Shape and side are checked by dflash2_grouped_conv_into.
 extern "C" CUresult dflash2_grouped_conv_cuda(
     const __nv_bfloat16* input, const __nv_bfloat16* dynamic,
     const __nv_bfloat16* base, __nv_bfloat16* output, int rows, int hidden,
     int block, int group_size, int taps, int side, cudaStream_t stream) {
-  if (!input || !dynamic || !base || !output || rows <= 0 || hidden <= 0 ||
-      block <= 0 || group_size <= 0 || taps <= 0 || side < 0 || side > 1 ||
-      rows % block != 0 || hidden % group_size != 0) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
   const int64_t count = static_cast<int64_t>(rows) * hidden;
   const int grid = static_cast<int>(std::min<int64_t>((count + 255) / 256, 65535));
   grouped_conv_kernel<<<grid, 256, 0, stream>>>(
       input, dynamic, base, output, rows, hidden, block, group_size, taps, side);
-  return static_cast<CUresult>(cudaGetLastError());
+  return map_cuda_error(cudaGetLastError());
 }

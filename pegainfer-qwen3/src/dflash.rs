@@ -993,20 +993,10 @@ impl DFlashDraftModel {
 }
 
 #[cfg(test)]
-pub(crate) fn validate_dflash_config_for_target(
-    dflash_path: &str,
-    target_config: &crate::config::Config,
-) -> Result<DFlashConfig> {
-    let config = DFlashConfig::from_file(dflash_path)?;
-    config.validate_for_target(target_config)?;
-    Ok(config)
-}
-
-#[cfg(test)]
 mod tests {
     use std::path::Path;
 
-    use super::validate_dflash_config_for_target;
+    use super::DFlashConfig;
     use crate::config::Config;
 
     #[test]
@@ -1025,7 +1015,9 @@ mod tests {
         }
 
         let target = Config::from_file(&target_path).expect("target config");
-        let dflash = validate_dflash_config_for_target(&dflash_path, &target)
+        let dflash = DFlashConfig::from_file(&dflash_path).expect("DFlash config");
+        dflash
+            .validate_for_target(&target)
             .expect("DFlash config should match target");
 
         assert_eq!(dflash.block_size, 16);
@@ -1036,10 +1028,9 @@ mod tests {
         // term (draft KV 5*2*1024*2 + scratch-context (3*2560+2*1024)*2 + pending
         // 2560*5*2) drives the ~12% block haircut; a layer-count or geometry
         // regression here would silently over/under-reserve and risk OOM.
-        let reservation = super::DFlashMemoryReservation::backbone_from_config(
-            &dflash, /*max_decode_batch*/ 256,
-        )
-        .expect("reservation sizing");
+        let reservation =
+            super::DFlashMemoryReservation::from_config(&dflash, /*max_decode_batch*/ 256)
+                .expect("reservation sizing");
         assert_eq!(
             reservation.kv_bytes_per_token, 65_536,
             "draft KV(20480) + scratch-ctx(19456) + pending(25600) per token"
@@ -1047,7 +1038,7 @@ mod tests {
         // Weights (~1.1 GiB) dominate the fixed term at batch=1; the block-sized
         // per-request scratch (~6.5 MiB, logits-heavy) plus the one-block KV/tail
         // headroom (~0.5 MiB) add across the decode batch.
-        let fixed_batch1 = super::DFlashMemoryReservation::backbone_from_config(&dflash, 1)
+        let fixed_batch1 = super::DFlashMemoryReservation::from_config(&dflash, 1)
             .expect("reservation sizing")
             .fixed_bytes;
         assert!(

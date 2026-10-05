@@ -5,6 +5,8 @@ mod attention;
 mod deepep;
 #[cfg(feature = "deepseek-v2-lite")]
 mod deepseek_v2_lite;
+mod dflash2;
+mod dflash2_conv;
 #[cfg(feature = "deepseek-v2-lite")]
 mod dsv2_routed_moe;
 #[cfg(feature = "deepseek-v2-lite")]
@@ -17,8 +19,6 @@ pub use dsv2_routed_moe::Dsv2RouteSummary;
 pub use dsv2_routed_moe::Dsv2RoutedMoeScratch;
 #[cfg(feature = "deepseek-v2-lite")]
 pub use dsv2_routed_moe::dsv2_lite_route_logits_into;
-mod dflash2;
-mod dflash2_conv;
 mod elementwise;
 mod embedding;
 #[cfg(feature = "gemma4")]

@@ -75,7 +75,6 @@ impl Inputs {
 }
 
 struct Oracle {
-    candidates: Vec<u32>,
     unary: Vec<f32>,
     edges: Vec<f32>,
     path: Vec<u32>,
@@ -83,7 +82,6 @@ struct Oracle {
 
 fn oracle(input: &Inputs, active: usize, candidates: &[u32]) -> Oracle {
     let mut output = Oracle {
-        candidates: Vec::new(),
         unary: Vec::new(),
         edges: Vec::new(),
         path: Vec::new(),
@@ -99,7 +97,6 @@ fn oracle(input: &Inputs, active: usize, candidates: &[u32]) -> Oracle {
                 .iter()
                 .map(|&id| id as usize)
                 .collect();
-            output.candidates.extend(ids.iter().map(|&id| id as u32));
             output
                 .unary
                 .extend(ids.iter().map(|&id| logits[id].to_f32()));
@@ -207,8 +204,8 @@ fn verify(
         graph.launch()?;
         assert_eq!(ctx.stream.clone_dtoh(scratch.error_flag())?, [0]);
         assert_eq!(
-            &ctx.stream.clone_dtoh(scratch.candidate_ids())?[..expected.candidates.len()],
-            expected.candidates
+            &ctx.stream.clone_dtoh(scratch.candidate_ids())?[..active * LENGTH * K],
+            &candidates[..active * LENGTH * K]
         );
         assert_eq!(
             &ctx.stream.clone_dtoh(scratch.selected_ids())?[..expected.path.len()],
