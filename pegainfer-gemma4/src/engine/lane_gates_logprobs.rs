@@ -118,10 +118,11 @@ fn a_low_slot_chunked_pool_scores_up_to_what_it_holds() {
     harness.shutdown(&[]);
 }
 
-#[test]
-fn only_a_scored_prompt_is_bound_to_the_whole_prompt_ceiling() {
-    let request = |prompt_logprobs| Request {
-        prompt_tokens: ids(super::MAX_CONTEXT + 1, 9),
+/// A probe whose prompt is exactly `prompt_len` tokens, so a ceiling can be
+/// tested against a length known without reading the prompt back.
+fn ceiling_probe(prompt_len: usize, prompt_logprobs: Option<usize>) -> Request {
+    Request {
+        prompt_tokens: ids(prompt_len, 9),
         params: pegainfer_frontend::sampler::SamplingParams::default(),
         stop_policy: pegainfer_frontend::engine::StopPolicy::default(),
         max_tokens: 4,
@@ -131,11 +132,94 @@ fn only_a_scored_prompt_is_bound_to_the_whole_prompt_ceiling() {
         prompt_logprobs,
         trace_parent: None,
         client_label: None,
-    };
+    }
+}
+
+#[test]
+fn only_a_scored_prompt_is_bound_to_the_whole_prompt_ceiling() {
     let raised = 4 * super::MAX_CONTEXT;
-    assert!(super::validate_request(&request(None), raised, super::MAX_CONTEXT).is_ok());
+    let prompt_len = super::MAX_CONTEXT + 1;
+    assert!(
+        super::validate_request(
+            &ceiling_probe(prompt_len, None),
+            raised,
+            super::MAX_CONTEXT,
+            None
+        )
+        .is_ok()
+    );
     assert!(matches!(
-        super::validate_request(&request(Some(0)), raised, super::MAX_CONTEXT),
+        super::validate_request(
+            &ceiling_probe(prompt_len, Some(0)),
+            raised,
+            super::MAX_CONTEXT,
+            None
+        ),
         Err(RejectReason::EchoPrefillTokens { .. })
     ));
+}
+
+#[test]
+fn the_tp_prompt_ceiling_refuses_one_token_past_it() {
+    let raised = 4 * super::MAX_CONTEXT;
+    let prompt_len = super::MAX_CONTEXT + 1;
+    // The ceiling is the boundary: a prompt equal to it passes, one token past
+    // it is refused.
+    assert!(
+        super::validate_request(
+            &ceiling_probe(prompt_len, None),
+            raised,
+            super::MAX_CONTEXT,
+            Some(prompt_len)
+        )
+        .is_ok()
+    );
+    assert!(matches!(
+        super::validate_request(
+            &ceiling_probe(prompt_len, None),
+            raised,
+            super::MAX_CONTEXT,
+            Some(prompt_len - 1)
+        ),
+        Err(RejectReason::Unsupported { .. })
+    ));
+}
+
+/// A token id outside the embedding fails in `prepare_single`'s
+/// `validate_tokens`, before the tower allocates anything or — under tensor
+/// parallelism — before rank 0 issues a single collective. So a prompt carrying
+/// one is a deterministic prefill fault that needs no injection hook, and the
+/// property under test is its **scope**: the driver contract makes `Err` from
+/// `Scheduler::step` mean "the engine is beyond use", so a request-local fault
+/// that escaped as `Err` would close the step stream and write off every open
+/// account. Both prefill paths have to answer it by failing that one request.
+#[test]
+#[ignore = "requires a Gemma 4 checkpoint, a GPU, and --test-threads=1"]
+fn a_failed_prefill_costs_that_request_not_the_engine() {
+    let mut harness = launch(&[]);
+    for (name, salt, prompt_logprobs) in [("scored", 1u32, Some(8)), ("plain", 2, None)] {
+        // `u32::MAX` is outside any vocabulary this line ships.
+        let bad = harness.submit_scored(vec![9, u32::MAX, 11 + salt], 4, None, prompt_logprobs);
+        match harness.steps.terminal(bad.id()) {
+            Terminal::Failed { message, .. } => assert!(
+                message.contains("prefill failed"),
+                "{name}: the request should fail as a prefill failure, got: {message}"
+            ),
+            other => panic!("{name}: an unusable prompt must fail that request, not {other:?}"),
+        }
+        // The engine is still serving, and the failed request's pages came back
+        // with its KV: a good request is admitted and completes afterwards.
+        let good = harness.submit_scored(ids(12, 7 + salt), 4, None, prompt_logprobs);
+        let drained = harness.steps.drain(good.id(), name);
+        assert_eq!(
+            drained.tokens, 4,
+            "{name}: the request after a failed prefill still decodes to its budget"
+        );
+        assert_eq!(
+            drained.finish,
+            FinishReason::Length,
+            "{name}: and finishes on its budget"
+        );
+    }
+    harness.shutdown(&[]);
 }

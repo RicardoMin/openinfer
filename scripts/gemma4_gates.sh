@@ -12,7 +12,7 @@
 #
 #   PEGAINFER_TEST_MODEL_PATH=<dense-checkpoint> \
 #     PEGAINFER_NVFP4_MODEL=<routed-checkpoint> \
-#     [PEGAINFER_GATE_GPU=<index-or-UUID>] scripts/gemma4_gates.sh [filter]
+#     [PEGAINFER_GATE_GPU=<index-or-UUID-or-pair>] scripts/gemma4_gates.sh [filter]
 #
 # A filter runs the subset of manifest gates whose names contain it; the
 # membership check still covers the whole manifest.
@@ -68,6 +68,7 @@ GATES_SERVING_CONTRACT=(
   "gpu,ckpt engine::lane_gates_logprobs::prompt_scores_bypass_the_prefix_cache_and_match_teacher_forced_decode"
   "gpu,ckpt engine::lane_gates_logprobs::a_scored_prompt_beside_a_live_batch_is_prefilled_whole"
   "gpu,ckpt engine::lane_gates_logprobs::a_low_slot_chunked_pool_scores_up_to_what_it_holds"
+  "gpu,ckpt engine::lane_gates_logprobs::a_failed_prefill_costs_that_request_not_the_engine"
 )
 GATES_KV_AND_LANES=(
   "gpu,ckpt,fixtures serve::oracle::incremental_serving_matches_recompute"
@@ -111,6 +112,11 @@ GATES_KERNELS_HD256_FP8_POOL=(
   "gpu decode_wrapper_without_fp8_twin_refuses_e4m3"
   "gpu the_generated_windowed_prefill_refuses_e4m3"
 )
+GATES_TENSOR_PARALLEL=(
+  "tp2,ckpt engine::lane_gates_tp::the_two_rank_engine_matches_one_rank"
+  "tp2,ckpt engine::lane_gates_tp::the_two_rank_engine_scores_prompt_logprobs"
+  "tp2,ckpt,hf31 engine::lane_gates_tp::the_two_rank_engine_matches_the_hf_reference"
+)
 MANIFEST_LIB=(
   "${GATES_NUMERIC_PARITY[@]}"
   "${GATES_ADMISSION[@]}"
@@ -121,6 +127,7 @@ MANIFEST_LIB=(
   "${GATES_DEVICE[@]}"
   "${GATES_ROUTED[@]}"
   "${GATES_TILELANG_GLOBAL[@]}"
+  "${GATES_TENSOR_PARALLEL[@]}"
 )
 GATES_FP8_PROFILE=(
   "serve::oracle::context_waypoints_match_hf"
@@ -212,48 +219,81 @@ moe_ckpt=
 gpu_uuid=
 gpu_lock_fd=
 
-require_gpu() {
-  command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi is unavailable, so no device can be claimed"
+# Claim `count` devices for this run and export them as one
+# `CUDA_VISIBLE_DEVICES` list. The single-device gates and the two-rank gate
+# draw from the same reservation, so a full-suite run never tries to lock a
+# device it already holds, and a pair may be named in `PEGAINFER_GATE_GPU`.
+# `PEGAINFER_GATE_GPU` names the devices ("a" or "a,b"); otherwise they come
+# from `CUDA_VISIBLE_DEVICES`, else the first `count` visible devices.
+require_devices() {
+  local count=$1
+  command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi is unavailable, so no devices can be claimed"
   command -v flock >/dev/null 2>&1 || die "flock is unavailable, so device ownership cannot be enforced"
 
   local selector=${PEGAINFER_GATE_GPU:-}
+  local explicit=0
   if [ -z "$selector" ] && [ "${CUDA_VISIBLE_DEVICES+x}" = x ]; then
     [ -n "$CUDA_VISIBLE_DEVICES" ] || die \
       "CUDA_VISIBLE_DEVICES is empty; set PEGAINFER_GATE_GPU to claim a device"
-    [[ $CUDA_VISIBLE_DEVICES != *,* ]] || die \
-      "CUDA_VISIBLE_DEVICES must name one device; set PEGAINFER_GATE_GPU explicitly"
     selector=$CUDA_VISIBLE_DEVICES
   fi
-  selector=${selector:-0}
-  [[ $selector != *,* ]] || die "PEGAINFER_GATE_GPU must name exactly one device"
-
-  local rows=() row compute_mode lock_key lock_path
-  mapfile -t rows < <(
-    nvidia-smi -i "$selector" --query-gpu=uuid,compute_mode --format=csv,noheader 2>/dev/null
-  )
-  [ ${#rows[@]} -eq 1 ] || die "device selector $selector does not resolve to one GPU"
-  row=${rows[0]}
-  gpu_uuid=${row%%,*}
-  gpu_uuid=${gpu_uuid//[[:space:]]/}
-  compute_mode=${row#*,}
-  compute_mode=${compute_mode#"${compute_mode%%[![:space:]]*}"}
-  compute_mode=${compute_mode%"${compute_mode##*[![:space:]]}"}
-  [ "$compute_mode" != Prohibited ] || die "GPU $gpu_uuid prohibits compute contexts"
-  [[ $gpu_uuid =~ ^[A-Za-z0-9._:/-]+$ ]] || die "nvidia-smi returned an unsafe GPU identity"
-
-  export CUDA_VISIBLE_DEVICES=$gpu_uuid
-  lock_key=${gpu_uuid//\//_}
-  lock_key=${lock_key//:/_}
-  lock_path=$GPU_LOCK_ROOT/pegainfer-gemma4-gates-$lock_key.lock
-  if (umask 022; set -o noclobber; : >"$lock_path") 2>/dev/null; then
-    :
-  elif [ ! -e "$lock_path" ]; then
-    die "cannot create device lock $lock_path"
+  [ -n "$selector" ] && explicit=1
+  local picks=()
+  [ -z "$selector" ] || IFS=',' read -r -a picks <<<"$selector"
+  if [ ${#picks[@]} -lt "$count" ]; then
+    # An explicit selector is never substituted: naming one device (as a SLURM
+    # job does) means "use this one", so a two-rank run drops its two-rank gates
+    # rather than take a different device; naming none at all is a mistake.
+    if [ "$explicit" -eq 1 ]; then
+      [ ${#picks[@]} -gt 0 ] || die "the device selector names no device"
+      return 1
+    fi
+    picks=()
+    mapfile -t picks < <(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null)
   fi
-  # A read-only descriptor lets separate Unix accounts lock the same inode.
-  exec {gpu_lock_fd}<"$lock_path" || die "cannot open device lock $lock_path"
-  flock -n "$gpu_lock_fd" || die "GPU $gpu_uuid is already owned by another Gemma 4 gate runner"
-  echo "gemma4 gates: claimed GPU $gpu_uuid (selector $selector)"
+  # Not enough devices and nobody named them: `return 1` lets a run that can drop
+  # its two-rank gates carry on rather than fail.
+  [ ${#picks[@]} -ge "$count" ] || return 1
+
+  local uuids=() rows=() row compute_mode sel uuid seen
+  for sel in "${picks[@]:0:$count}"; do
+    mapfile -t rows < <(
+      nvidia-smi -i "$sel" --query-gpu=uuid,compute_mode --format=csv,noheader 2>/dev/null
+    )
+    [ ${#rows[@]} -eq 1 ] || die "device selector $sel does not resolve to one GPU"
+    row=${rows[0]}
+    uuid=${row%%,*}
+    uuid=${uuid//[[:space:]]/}
+    compute_mode=${row#*,}
+    compute_mode=${compute_mode#"${compute_mode%%[![:space:]]*}"}
+    compute_mode=${compute_mode%"${compute_mode##*[![:space:]]}"}
+    [ "$compute_mode" != Prohibited ] || die "GPU $uuid prohibits compute contexts"
+    [[ $uuid =~ ^[A-Za-z0-9._:/-]+$ ]] || die "nvidia-smi returned an unsafe GPU identity"
+    for seen in "${uuids[@]:-}"; do
+      [ "$seen" != "$uuid" ] || die "device selector names $uuid twice"
+    done
+    uuids+=("$uuid")
+  done
+
+  gpu_uuid=$(IFS=,; printf '%s' "${uuids[*]}")
+  export CUDA_VISIBLE_DEVICES=$gpu_uuid
+  local lock_fds=() fd uuid2 lock_key lock_path
+  for uuid2 in "${uuids[@]}"; do
+    lock_key=${uuid2//\//_}
+    lock_key=${lock_key//:/_}
+    lock_path=$GPU_LOCK_ROOT/pegainfer-gemma4-gates-$lock_key.lock
+    if (umask 022; set -o noclobber; : >"$lock_path") 2>/dev/null; then
+      :
+    elif [ ! -e "$lock_path" ]; then
+      die "cannot create device lock $lock_path"
+    fi
+    # A read-only descriptor lets separate Unix accounts lock the same inode.
+    exec {fd}<"$lock_path" || die "cannot open device lock $lock_path"
+    flock -n "$fd" || die "GPU $uuid2 is already owned by another Gemma 4 gate runner"
+    lock_fds+=("$fd")
+  done
+  gpu_lock_fd=${lock_fds[0]}
+  echo "gemma4 gates: claimed $count GPU(s) $gpu_uuid"
   echo "gemma4 gates: storage profile $gate_storage"
   if [ -n "${PEGAINFER_KV_FP8:-}" ]; then
     echo "gemma4 gates: PEGAINFER_KV_FP8=$PEGAINFER_KV_FP8"
@@ -552,13 +592,62 @@ if [ -z "$ROUTED_FIXTURE_TAG" ]; then
   [ ${#selected[@]} -gt 0 ] || die "every selected gate needed the routed fixture set"
 fi
 
+# The 31B Hugging Face fixture is a separate artifact from its checkpoint, so a
+# gate that compares against it leaves the run by name when it is not selected.
+# Only that the variable is set is checked here: the fixture's own manifest is
+# held against the checkpoint under test by `golden_bytes`, so checking the file
+# name on top of that could not catch a mismatched dump — only refuse a valid one
+# that happens to be named otherwise.
+hf31_mismatch=
+require_hf31() {
+  if [ -z "${PEGAINFER_GEMMA4_GOLDEN:-}" ]; then
+    hf31_mismatch="PEGAINFER_GEMMA4_GOLDEN is unset (point it at the 31B HF fixture)"
+  fi
+}
+
 # --- prerequisites: the union over what this run selected, and no more -----
 needs=" "
 for entry in "${selected[@]}"; do needs="$needs${entry%%|*} "; done
 needs=" ${needs//,/ } "
 demanded=""
-for want in gpu ckpt moeckpt prompts fixtures routedfixtures chatgolden tlgeom; do
-  case "$needs" in *" $want "*) "require_$want"; demanded="$demanded $want" ;; esac
+# One reservation covers both the single-device gates and the two-rank gate:
+# claim two devices when a tp2 gate is selected, one otherwise. Claiming per
+# gate type would try to lock a device this same process already holds.
+device_count=0
+case "$needs" in
+  *" tp2 "*) device_count=2 ;;
+  *" gpu "*) device_count=1 ;;
+esac
+if [ "$device_count" -gt 0 ] && ! require_devices "$device_count"; then
+  # Two devices were wanted and only one is visible; a one-GPU host should still
+  # run the rest, so drop the two-rank gates by name and claim the single one.
+  [ "$device_count" -eq 2 ] || die "a device is required but none could be claimed"
+  kept=(); dropped=0
+  for entry in "${selected[@]}"; do
+    case ",${entry%%|*}," in
+      *,tp2,*) dropped=$((dropped + 1)) ;;
+      *) kept+=("$entry") ;;
+    esac
+  done
+  selected=("${kept[@]}")
+  [ ${#selected[@]} -gt 0 ] || die \
+    "only two-rank gates were selected and a second device is unavailable"
+  echo "gemma4 gates: not selected, a second device is unavailable: $dropped two-rank gate(s)"
+  needs=" "
+  for entry in "${selected[@]}"; do needs="$needs${entry%%|*} "; done
+  needs=" ${needs//,/ } "
+  require_devices 1 || die "a device is required but none could be claimed"
+fi
+for want in gpu tp2 ckpt moeckpt prompts fixtures routedfixtures chatgolden tlgeom hf31; do
+  case "$needs" in
+    *" $want "*)
+      case "$want" in
+        gpu|tp2) : ;;
+        *) "require_$want" ;;
+      esac
+      demanded="$demanded $want"
+      ;;
+  esac
 done
 echo "gemma4 gates: prerequisites$demanded"
 
@@ -574,6 +663,19 @@ if [ -n "$tlgeom_mismatch" ]; then
   done
   selected=("${kept[@]}")
   [ ${#selected[@]} -gt 0 ] || die "every selected gate needed the kernels' own geometry"
+fi
+
+# And the same for a gate that needs the 31B Hugging Face fixture.
+if [ -n "$hf31_mismatch" ]; then
+  kept=()
+  for entry in "${selected[@]}"; do
+    case ",${entry%%|*}," in
+      *,hf31,*) echo "gemma4 gates: not selected, $hf31_mismatch: ${entry##*|}" ;;
+      *) kept+=("$entry") ;;
+    esac
+  done
+  selected=("${kept[@]}")
+  [ ${#selected[@]} -gt 0 ] || die "every selected gate needed the 31B HF fixture"
 fi
 
 echo "gemma4 gates: source $(git rev-parse HEAD)$([ -n "$(git status --porcelain)" ] && echo ' (dirty)')"
