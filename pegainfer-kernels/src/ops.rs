@@ -211,6 +211,7 @@ pub use lora::LoraDecodeGroupedProjection;
 pub use lora::lora_decode_fused_delta_group3_into;
 pub use lora::lora_decode_fused_delta_into;
 pub use lora::pack_lora_b_rows_into;
+pub use norm::GatedNormActivation;
 pub use norm::dual_rms_norm_add_batch_into;
 pub use norm::fused_add_rms_norm_batch_into;
 pub use norm::fused_add_rms_norm_into;
