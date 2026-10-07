@@ -1,17 +1,33 @@
+use std::collections::HashMap;
+
 use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::PromptEcho;
 use pegainfer_frontend::engine::RejectReason;
 use pegainfer_frontend::engine::Request;
 use pegainfer_frontend::engine::Terminal;
 
+use super::lane_gates_tp::assert_finite;
+use super::lane_tests::Harness;
 use super::lane_tests::ids;
 use super::lane_tests::launch;
 use super::lane_tests::pin_live_stream;
-use super::lane_tests::warm_prompt;
 
-/// Decode steps one row at a time and the whole-prompt pass many; both are
-/// bf16 forwards, so a token's two scores differ by rounding, not by more.
-const LOGPROB_TOLERANCE: f32 = 0.10;
+const TOP_K: usize = 8;
+
+/// Four times the sliding window, so the resume runs through a truncated local family.
+const RESUME_TOKENS: usize = 4096;
+/// Short of the resume, so the resume prefills a suffix through the cache.
+const SEED_TOKENS: usize = 4000;
+const DECODE_TOKENS: usize = 6;
+
+/// The resumed leg against the cold leg on the same prompt. Measured on the
+/// pinned 12B on sm_89 at 4096 tokens: cold 0.278 nat, resumed 0.323.
+const LOGPROB_RATIO: f32 = 2.0;
+const LOGPROB_FLOOR: f32 = 0.10;
+/// The ratio alone passes a fault both legs share, so the cold leg has its own
+/// line. At this prompt's first scored position the window fixture's sdpa and
+/// eager rows differ by 0.315 nat on the same token; the cold leg measured 0.278.
+const COLD_LOGPROB_LINE: f32 = 0.5;
 
 fn assert_echo_covers(echo: &PromptEcho, prompt: &[u32], top_k: usize) {
     assert_eq!(echo.ids, prompt, "the echo names the prompt");
@@ -28,42 +44,118 @@ fn assert_echo_covers(echo: &PromptEcho, prompt: &[u32], top_k: usize) {
     }
 }
 
-#[test]
-#[ignore = "requires a Gemma 4 checkpoint, a GPU, and --test-threads=1"]
-fn prompt_scores_bypass_the_prefix_cache_and_match_teacher_forced_decode() {
-    let mut harness = launch(&[(super::PREFIX_CACHE_ENV, "4")]);
-    let long_prompt = ids(1500, 7);
-    let seed = harness.submit(long_prompt.clone(), 4);
-    harness.steps.drain(seed.id(), "cache seed");
-
-    let head = warm_prompt(&long_prompt);
-    let sampled = harness.submit_scored(head.clone(), 6, Some(0), None);
-    let sampled = harness.steps.drain(sampled.id(), "sampled");
-    assert!(sampled.cached > 0, "the seeded prefix resumes");
-
-    let replayed = [head.clone(), sampled.ids.clone()].concat();
-    let replay = harness.submit_scored(replayed.clone(), 1, None, Some(0));
-    let replay = harness.steps.drain(replay.id(), "replayed");
+/// Decodes from `head`, scores the replayed prompt whole, and returns the worst
+/// logprob gap and the decode's resume frontier.
+fn teacher_forced_worst(harness: &mut Harness, head: &[u32]) -> (f32, usize) {
+    let sampled = harness.steps.drain(
+        harness
+            .submit_scored(head.to_vec(), DECODE_TOKENS, Some(TOP_K), None)
+            .id(),
+        "sampled",
+    );
+    let replayed = [head.to_vec(), sampled.ids.clone()].concat();
+    let replay = harness.steps.drain(
+        harness
+            .submit_scored(replayed.clone(), 1, None, Some(TOP_K))
+            .id(),
+        "replayed",
+    );
     assert_eq!(replay.cached, 0, "a scored prompt never resumes");
     let echo = replay.prompt_echo.expect("the replay echoes its prompt");
-    assert_echo_covers(&echo, &replayed, 0);
+    assert_echo_covers(&echo, &replayed, TOP_K);
 
-    let mut max_delta = 0.0_f32;
+    // A flipped argmax must stay a near tie: each pick inside the other side's top-k.
+    let mut worst = 0.0_f32;
     for (i, decoded) in sampled.logprobs.iter().enumerate() {
-        let decoded = decoded.as_ref().expect("sampled token scored").logprob;
+        let decoded = decoded.as_ref().expect("sampled token scored");
         let whole = echo.logprobs[head.len() + i]
             .as_ref()
-            .expect("prompt position scored")
-            .logprob;
-        let delta = (decoded - whole).abs();
-        max_delta = max_delta.max(delta);
+            .expect("prompt position scored");
+        assert_finite(decoded, &format!("position {i} (decode)"));
+        assert_finite(whole, &format!("position {i} (readback)"));
+        worst = worst.max((decoded.logprob - whole.logprob).abs());
+        let ours = sampled.ids[i];
+        let theirs = whole.top_logprobs[0].0;
+        if ours == theirs {
+            continue;
+        }
+        let ours_top: HashMap<u32, f32> = decoded.top_logprobs.iter().copied().collect();
+        let theirs_top: HashMap<u32, f32> = whole.top_logprobs.iter().copied().collect();
         assert!(
-            delta <= LOGPROB_TOLERANCE,
-            "position {i}: decode {decoded}, whole prompt {whole}"
+            theirs_top.contains_key(&ours),
+            "position {i}: the decode sampled {ours}, which the readback's top-{TOP_K} does \
+             not carry (decode top-{TOP_K} {:?}, readback top-{TOP_K} {:?})",
+            decoded.top_logprobs,
+            whole.top_logprobs
         );
+        assert!(
+            ours_top.contains_key(&theirs),
+            "position {i}: the readback picks {theirs}, which the decode's top-{TOP_K} does \
+             not carry (readback top-{TOP_K} {:?}, decode top-{TOP_K} {:?})",
+            whole.top_logprobs,
+            decoded.top_logprobs
+        );
+        // `ours` is the replayed token, already compared above.
+        worst = worst.max((ours_top[&theirs] - theirs_top[&theirs]).abs());
     }
-    eprintln!("teacher-forced max_delta={max_delta:.6} nat");
+    (worst, sampled.cached)
+}
+
+#[test]
+#[ignore = "requires a Gemma 4 checkpoint, a GPU, fixtures, and --test-threads=1"]
+fn prompt_scores_bypass_the_prefix_cache_and_match_teacher_forced_decode() {
+    let dir = crate::testkit::model_path();
+    let (_, golden) = crate::testkit::golden_bytes(&dir);
+    let window_path = crate::testkit::fixture_path(
+        "PEGAINFER_GEMMA4_WINDOW_GOLDEN",
+        "gemma4-12b-hf-window-golden.safetensors",
+    );
+    let window_bytes = std::fs::read(&window_path).expect("read the window fixture");
+    let window = safetensors::SafeTensors::deserialize(&window_bytes).expect("window fixture");
+    let window_manifest = crate::testkit::fixture_manifest(&window_bytes, "gemma4_window_golden");
+    assert_eq!(
+        window_manifest["revision"], golden["revision"],
+        "the window fixture was dumped from a different revision than the checkpoint under test"
+    );
+    let (_, prose) = crate::testkit::u32_tensor(&window, "w4096_prompt");
+    assert!(
+        prose.len() >= RESUME_TOKENS,
+        "the window fixture's w4096 prompt is {} tokens, not {RESUME_TOKENS}",
+        prose.len()
+    );
+    let head = prose[..RESUME_TOKENS].to_vec();
+    let seed_prompt = prose[..SEED_TOKENS].to_vec();
+
+    let mut cold = launch(&[]);
+    let (cold_worst, _) = teacher_forced_worst(&mut cold, &head);
+    cold.shutdown(&[]);
+    assert!(
+        cold_worst <= COLD_LOGPROB_LINE,
+        "the cold readback and decode differ by {cold_worst} nat (line {COLD_LOGPROB_LINE})"
+    );
+
+    let mut harness = launch(&[(super::PREFIX_CACHE_ENV, "4")]);
+    let seed = harness.submit(seed_prompt, 4);
+    harness.steps.drain(seed.id(), "cache seed");
+    let (resumed_worst, resumed_at) = teacher_forced_worst(&mut harness, &head);
     harness.shutdown(&[]);
+
+    assert!(
+        resumed_at >= SEED_TOKENS - 1,
+        "the seeded prefix resumes only {resumed_at} of its {SEED_TOKENS} tokens, so this \
+         run did not prefill a suffix through the cache"
+    );
+    let ceiling = (LOGPROB_RATIO * cold_worst).max(LOGPROB_FLOOR);
+    eprintln!(
+        "teacher-forced at a {resumed_at}-token frontier of {RESUME_TOKENS}: cold \
+         {cold_worst:.6} nat, resumed {resumed_worst:.6} nat (ceiling {ceiling:.6})"
+    );
+    assert!(
+        resumed_worst <= ceiling,
+        "the cache-resumed comparison is {resumed_worst} nat against a cold run's \
+         {cold_worst} on the same prompt (ceiling {ceiling} = {LOGPROB_RATIO}x cold, floor \
+         {LOGPROB_FLOOR})"
+    );
 }
 
 #[test]
