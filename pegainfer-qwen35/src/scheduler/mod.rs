@@ -37,6 +37,7 @@ use pegainfer_frontend::engine::RequestId as FrontendRequestId;
 use pegainfer_frontend::engine::RequestLedger;
 use pegainfer_frontend::engine::Scheduler;
 use pegainfer_frontend::engine::SchedulerMetrics;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::engine::drive;
 use pegainfer_frontend::engine::panic_message;
@@ -95,6 +96,7 @@ struct ActiveRequest35 {
     max_tokens: usize,
     prompt_len: usize,
     params: SamplingParams,
+    stop_policy: StopPolicy,
     /// Optional top-logprob count; Some(0) scores only the chosen token.
     logprobs: Option<usize>,
 }
@@ -1122,15 +1124,18 @@ fn dispatch_decode_tokens(
             continue;
         }
         let token = tokens[i];
-        let finish = if !req.params.ignore_eos && backend.is_stop_token(token) {
-            Some(FinishReason::Stop)
+        let finish = if let Some(cause) = req
+            .stop_policy
+            .classify(token, |id| backend.is_stop_token(id))
+        {
+            Some((FinishReason::Stop, Some(cause)))
         } else if ledger.completion_tokens(req.id) + 1 >= req.max_tokens {
-            Some(FinishReason::Length)
+            Some((FinishReason::Length, None))
         } else {
             None
         };
-        if let Some(reason) = finish {
-            to_retire.push((i, Some(reason)));
+        if finish.is_some() {
+            to_retire.push((i, finish));
         } else {
             ledger.push_tokens(req.id, &[token], std::slice::from_ref(&logprobs[i]));
             req.last_token = token;
@@ -1143,10 +1148,8 @@ fn dispatch_decode_tokens(
         backend.drop_active_state(&request.backend_state)?;
         if ledger.is_aborted(request.id) {
             ledger.retire(request.id);
-        } else if let Some(reason) = finish {
-            if reason == FinishReason::Length {
-                ledger.push_tokens(request.id, &[tokens[i]], std::slice::from_ref(&logprobs[i]));
-            }
+        } else if let Some((reason, stop_cause)) = finish {
+            ledger.push_tokens(request.id, &[tokens[i]], std::slice::from_ref(&logprobs[i]));
             debug!(
                 "request finished: request_id={:?} prompt_tokens={} completion_tokens={} finish_reason={:?}",
                 request.client_label,
@@ -1154,7 +1157,7 @@ fn dispatch_decode_tokens(
                 ledger.completion_tokens(request.id),
                 reason
             );
-            ledger.finish(request.id, reason);
+            ledger.finish_with_cause(request.id, reason, stop_cause);
         }
     }
     Ok(())
@@ -1388,22 +1391,24 @@ fn promote_or_requeue(
 
         let artifact = artifacts.final_artifact(i);
         let first_token = artifact.token;
-        let finish = if !req.request.params.ignore_eos && backend.is_stop_token(first_token) {
-            Some(FinishReason::Stop)
+        let finish = if let Some(cause) = req
+            .request
+            .stop_policy
+            .classify(first_token, |id| backend.is_stop_token(id))
+        {
+            Some((FinishReason::Stop, Some(cause)))
         } else if req.request.max_tokens <= 1 {
-            Some(FinishReason::Length)
+            Some((FinishReason::Length, None))
         } else {
             None
         };
-        if let Some(reason) = finish {
+        if let Some((reason, stop_cause)) = finish {
             backend.drop_prefill_state(&backend_state, DropExpectation::MustExist)?;
             if ledger.is_aborted(req.id) {
                 ledger.retire(req.id);
             } else {
-                if reason == FinishReason::Length {
-                    ledger.push_tokens(req.id, &[first_token], &[artifact.logprob]);
-                }
-                ledger.finish(req.id, reason);
+                ledger.push_tokens(req.id, &[first_token], &[artifact.logprob]);
+                ledger.finish_with_cause(req.id, reason, stop_cause);
             }
             continue;
         }
@@ -1418,6 +1423,7 @@ fn promote_or_requeue(
             max_tokens: req.request.max_tokens,
             prompt_len: req.request.prompt_tokens.len(),
             params: req.request.params,
+            stop_policy: req.request.stop_policy,
             logprobs: req.request.logprobs,
         });
     }

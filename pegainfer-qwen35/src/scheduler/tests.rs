@@ -1,6 +1,8 @@
 use std::time::Duration;
 
+use pegainfer_frontend::engine::EosPolicy;
 use pegainfer_frontend::engine::RequestUpdate;
+use pegainfer_frontend::engine::StopCause;
 use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::engine::Terminal;
 
@@ -13,7 +15,7 @@ fn test_request(label: &str, prompt_tokens: Vec<u32>, max_tokens: usize) -> Requ
             ignore_eos: true,
             ..SamplingParams::default()
         },
-        stop_policy: StopPolicy::default(),
+        stop_policy: StopPolicy::new(EosPolicy::Ignore, vec![]),
         max_tokens,
         lora_adapter: None,
         kv_transfer_params: None,
@@ -89,6 +91,7 @@ fn active_request(
         max_tokens: req.request.max_tokens,
         prompt_len: req.request.prompt_tokens.len(),
         params: req.request.params,
+        stop_policy: req.request.stop_policy,
         logprobs: req.request.logprobs,
     }
 }
@@ -231,6 +234,7 @@ fn closed_resident_work_is_pruned() {
 fn decode_eos_waits_for_drop_before_finished() {
     let mut request = test_request("decode-eos", vec![1], 8);
     request.params.ignore_eos = false;
+    request.stop_policy = StopPolicy::default();
     let updates = run_step(vec![request], &[], |mut requests, ledger| {
         let mut active = vec![active_request(requests.remove(0), 30, ledger)];
         let mut backend = LifecycleTestBackend {
@@ -243,16 +247,85 @@ fn decode_eos_waits_for_drop_before_finished() {
         Ok(())
     });
     assert_eq!(updates.len(), 1);
-    assert_eq!(updates[0].tokens, vec![1]);
+    assert_eq!(updates[0].tokens, vec![1, 9]);
     assert!(matches!(
         updates[0].terminal,
         Some(Terminal::Finished {
             reason: FinishReason::Stop,
-            completion_tokens: 1,
-            stop_cause: None,
+            completion_tokens: 2,
+            stop_cause: Some(StopCause::Eos(9)),
             ..
         })
     ));
+}
+
+#[test]
+fn decode_stop_policies_survive_batch_compaction() {
+    let mut explicit = test_request("explicit-eos", vec![1], 2);
+    explicit.stop_policy = StopPolicy::new(EosPolicy::Ignore, vec![9]);
+    explicit.logprobs = Some(0);
+    let mut continuing = test_request("ignore-eos", vec![1], 3);
+    continuing.stop_policy = StopPolicy::new(EosPolicy::Ignore, vec![7]);
+    continuing.logprobs = Some(0);
+    let updates = run_step(vec![explicit, continuing], &[], |requests, ledger| {
+        let mut active: Vec<_> = requests
+            .into_iter()
+            .enumerate()
+            .map(|(index, request)| active_request(request, 40 + index as u64, ledger))
+            .collect();
+        let mut backend = LifecycleTestBackend {
+            stop_token: Some(9),
+            ..Default::default()
+        };
+        let logprobs = [-0.25, -0.5].map(|logprob| {
+            Some(TokenLogprob {
+                logprob,
+                rank: 1,
+                top_logprobs: vec![],
+            })
+        });
+        dispatch_decode_tokens(&mut backend, &mut active, &[9, 9], &logprobs, ledger)?;
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].client_label.as_deref(), Some("ignore-eos"));
+        dispatch_decode_tokens(
+            &mut backend,
+            &mut active,
+            &[7],
+            &[Some(TokenLogprob {
+                logprob: -0.75,
+                rank: 1,
+                top_logprobs: vec![],
+            })],
+            ledger,
+        )
+    });
+    assert_eq!(updates.len(), 2);
+    for (id, tokens, logprobs, trigger) in [
+        (0, vec![1, 9], vec![None, Some(-0.25)], 9),
+        (1, vec![1, 9, 7], vec![None, Some(-0.5), Some(-0.75)], 7),
+    ] {
+        let update = updates
+            .iter()
+            .find(|update| update.id == FrontendRequestId::new(id))
+            .unwrap();
+        assert_eq!(update.tokens, tokens);
+        assert_eq!(
+            update
+                .logprobs
+                .iter()
+                .map(|entry| entry.as_ref().map(|entry| entry.logprob))
+                .collect::<Vec<_>>(),
+            logprobs
+        );
+        assert!(matches!(
+            update.terminal,
+            Some(Terminal::Finished {
+                reason: FinishReason::Stop,
+                stop_cause: Some(StopCause::Token(token)),
+                ..
+            }) if token == trigger
+        ));
+    }
 }
 
 #[test]
@@ -356,6 +429,46 @@ fn immediate_prefill_completion_waits_for_drop() {
             reason: FinishReason::Length,
             stop_cause: None,
             completion_tokens: 1,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn immediate_prefill_stop_keeps_trigger_and_logprob_at_length_limit() {
+    let mut request = test_request("prefill-stop", vec![1], 1);
+    request.stop_policy = StopPolicy::new(EosPolicy::Ignore, vec![11]);
+    request.logprobs = Some(0);
+    let updates = run_step(vec![request], &[], |mut requests, ledger| {
+        let mut request = prefilling_request(requests.remove(0), 41, ledger);
+        request.step_chunk = 1;
+        promote_or_requeue(
+            &mut LifecycleTestBackend::default(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            ScheduledChunk::from(vec![request]),
+            &PrefillStepArtifacts::Single {
+                tokens: vec![11],
+                logprobs: vec![Some(TokenLogprob {
+                    logprob: -0.125,
+                    rank: 1,
+                    top_logprobs: vec![],
+                })],
+            },
+            ledger,
+        )
+    });
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].tokens, vec![11]);
+    assert_eq!(
+        updates[0].logprobs[0].as_ref().unwrap().logprob.to_bits(),
+        (-0.125_f32).to_bits()
+    );
+    assert!(matches!(
+        updates[0].terminal,
+        Some(Terminal::Finished {
+            reason: FinishReason::Stop,
+            stop_cause: Some(StopCause::Token(11)),
             ..
         })
     ));
