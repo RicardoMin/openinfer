@@ -4,10 +4,10 @@
 #
 # The checkpoint-backed gates need real weights, fixtures and a device; the
 # kernels contracts need only a device. This script owns their execution:
-# it refuses to start unless every prerequisite is present, it holds each
-# discovered gate set against the manifest here so a gate cannot quietly leave
-# the suite. It claims one physical device for the suite's lifetime and runs one
-# gate per process — repeated checkpoint loads in one test binary exhaust a
+# it refuses to start unless every prerequisite is present, it holds the model's
+# discovered gates against the manifest and checks that each declared shared
+# kernel gate exists. It claims one physical device for the suite's lifetime
+# and runs one gate per process — repeated checkpoint loads in one test binary exhaust a
 # 48 GiB card.
 #
 #   PEGAINFER_TEST_MODEL_PATH=<dense-checkpoint> \
@@ -103,7 +103,6 @@ GATES_KERNELS=(
   "gpu ops::norm::parity::the_dual_norm_matches_two_standalone_norms"
   "gpu ops::norm::parity::the_layer_tail_matches_its_parts"
   "gpu ops::norm::parity::the_epilogue_norm_pair_matches_its_parts"
-  "gpu ops::norm::parity::the_gated_norm_activations_match_their_references"
   "gpu ops::norm::parity::the_moe_combine_tail_matches_its_parts"
 )
 GATES_KERNELS_HD256_FP8_POOL=(
@@ -457,7 +456,7 @@ require_chatgolden() {
 }
 
 
-# --- membership: the crate's ignored set must be exactly the manifest ------
+# --- membership: model gates are exact; declared shared gates must exist ---
 ignored_in() {
   local crate=$1
   shift
@@ -496,8 +495,11 @@ kernels_listing=$(ignored_in "$KERNELS_CRATE" --lib)
 [ -n "$kernels_listing" ] || die "could not list the kernels library's ignored gates"
 kernels_names=()
 for entry in "${GATES_KERNELS[@]}"; do kernels_names+=("${entry##* }"); done
+# The shared crate also owns other models' gates; only these belong to this suite.
+kernels_expected=$(printf '%s\n' "${kernels_names[@]}" | sort)
+kernels_listing=$(comm -12 <(printf '%s\n' "$kernels_listing") <(printf '%s\n' "$kernels_expected"))
 check_membership "kernels library" "$kernels_listing" \
-  "$(printf '%s\n' "${kernels_names[@]}" | sort)"
+  "$kernels_expected"
 
 kernels_pool_listing=$(listed_in "$KERNELS_CRATE" --test hd256_fp8_pool)
 [ -n "$kernels_pool_listing" ] || die "could not list the kernels hd256_fp8_pool integration gates"
