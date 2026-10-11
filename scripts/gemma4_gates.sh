@@ -4,11 +4,11 @@
 #
 # The checkpoint-backed gates need real weights, fixtures and a device; the
 # kernels contracts need only a device. This script owns their execution:
-# it refuses to start unless every prerequisite is present, it holds each
-# discovered gate set against the manifest here so a gate cannot quietly leave
-# the suite. It claims one physical device for the suite's lifetime and runs one
-# gate per process — repeated checkpoint loads in one test binary exhaust a
-# 48 GiB card.
+# it refuses to start unless every prerequisite is present, it holds every
+# discovered gate against the manifest, including explicit exclusions for
+# other models' shared kernel gates. It claims its physical devices for the
+# suite's lifetime and runs one gate per process — repeated checkpoint loads
+# in one test binary exhaust a 48 GiB card.
 #
 #   PEGAINFER_TEST_MODEL_PATH=<dense-checkpoint> \
 #     PEGAINFER_NVFP4_MODEL=<routed-checkpoint> \
@@ -102,6 +102,10 @@ GATES_KERNELS=(
   "gpu ops::norm::parity::the_layer_tail_matches_its_parts"
   "gpu ops::norm::parity::the_epilogue_norm_pair_matches_its_parts"
   "gpu ops::norm::parity::the_moe_combine_tail_matches_its_parts"
+)
+EXCLUDED_KERNELS=(
+  # Qwen3.5 / Qwen3.8 gated norm, not used by Gemma.
+  "ops::norm::parity::the_gated_norm_activations_match_their_references"
 )
 GATES_KERNELS_HD256_FP8_POOL=(
   "gpu fp8_prep_stores_exact_bytes_at_layout_offsets"
@@ -454,7 +458,7 @@ require_chatgolden() {
 }
 
 
-# --- membership: the crate's ignored set must be exactly the manifest ------
+# --- membership: every discovered gate is executed or explicitly excluded ---
 ignored_in() {
   local crate=$1
   shift
@@ -493,8 +497,11 @@ kernels_listing=$(ignored_in "$KERNELS_CRATE" --lib)
 [ -n "$kernels_listing" ] || die "could not list the kernels library's ignored gates"
 kernels_names=()
 for entry in "${GATES_KERNELS[@]}"; do kernels_names+=("${entry##* }"); done
+for gate in "${EXCLUDED_KERNELS[@]}"; do
+  ! gate_is_in "$gate" "${kernels_names[@]}" || die "kernel gate is both executed and excluded: $gate"
+done
 check_membership "kernels library" "$kernels_listing" \
-  "$(printf '%s\n' "${kernels_names[@]}" | sort)"
+  "$(printf '%s\n' "${kernels_names[@]}" "${EXCLUDED_KERNELS[@]}" | sort)"
 
 kernels_pool_listing=$(listed_in "$KERNELS_CRATE" --test hd256_fp8_pool)
 [ -n "$kernels_pool_listing" ] || die "could not list the kernels hd256_fp8_pool integration gates"
