@@ -372,6 +372,30 @@ fn start_with_knobs(
     options: &EngineLoadOptions,
     lookup: &dyn Fn(&str) -> Result<Option<String>>,
 ) -> Result<Engine> {
+    let state = load_with_knobs(model_path, options, lookup)?;
+    // Publishing the real ceiling is what lets the frontend refuse an
+    // over-length request with its own message instead of forwarding one the
+    // engine can only fail mid-stream.
+    // The ceiling domain keeps the value inside i32, so this API-boundary
+    // conversion cannot fail.
+    let servable =
+        u32::try_from(state.max_context).expect("ceiling domain holds servable inside u32");
+    let scheduler = Gemma4Scheduler::new(state);
+    Ok(Engine {
+        schedulers: vec![spawn_scheduler("gemma4-engine", scheduler)],
+        info: EngineInfo {
+            kv_capacity: None,
+            servable_len: Some(servable),
+        },
+        lora: None,
+    })
+}
+
+fn load_with_knobs(
+    model_path: &Path,
+    options: &EngineLoadOptions,
+    lookup: &dyn Fn(&str) -> Result<Option<String>>,
+) -> Result<EngineState> {
     let dir = model_path
         .to_str()
         .context("model path is not valid UTF-8")?
@@ -464,7 +488,7 @@ fn start_with_knobs(
         }
     }
 
-    let state = EngineState::load(
+    EngineState::load(
         &dir,
         &config,
         knobs,
@@ -472,23 +496,7 @@ fn start_with_knobs(
         policy,
         base_seed,
         graph_enabled,
-    )?;
-    let servable = state.max_context;
-    // Publishing the real ceiling is what lets the frontend refuse an
-    // over-length request with its own message instead of forwarding one the
-    // engine can only fail mid-stream.
-    // The ceiling domain keeps the value inside i32, so this API-boundary
-    // conversion cannot fail.
-    let servable = u32::try_from(servable).expect("ceiling domain holds servable inside u32");
-    let scheduler = Gemma4Scheduler::new(state);
-    Ok(Engine {
-        schedulers: vec![spawn_scheduler("gemma4-engine", scheduler)],
-        info: EngineInfo {
-            kv_capacity: None,
-            servable_len: Some(servable),
-        },
-        lora: None,
-    })
+    )
 }
 
 struct GenerationPolicy {
@@ -2865,6 +2873,7 @@ impl EngineState {
         resident: bool,
         slot: usize,
     ) -> Result<usize> {
+        anyhow::ensure!(self.more.is_empty(), "staged decode requires a single rank");
         let rows = active.len();
         let tokens = (!resident).then(|| active.iter().map(|entry| entry.next).collect::<Vec<_>>());
         {

@@ -53,7 +53,7 @@ Only the paths that prefill a prompt **on its own** — the solo whole-prompt st
 
 The invariant both shapes rely on is worth stating once, because nothing in the collective layer checks it: **with one thread driving every rank, every host blocking point must come after every rank's launch.** `all_reduce_rows` enqueues and returns; the thread may only wait once all the matching calls are in flight, or it waits on a collective whose peer call it has not issued yet.
 
-The staged decode pipeline (ids written by the previous step's sampler) is disabled under TP: a non-primary rank has no sampler and no ids of its own, so every rank takes the explicit-token path.
+TP collects rank 0's sampled IDs before starting the next decode, so every rank receives the latest token. Launching a staged successor before that readback would reuse the previous host token. The staged pipeline is therefore restricted to one rank; ordinary TP decode CUDA Graphs remain available.
 
 ## The collective
 
@@ -88,7 +88,7 @@ Every figure here and below is binary (1 GiB = 1024 MiB); the MiB columns are wh
 
 The startup error names the page counts when a budget cannot be allocated, and the global pool's size is logged once it is.
 
-The 8192 x 8 row is the one that has been served: 2.50 GiB global pool, 14.18 GiB free after weights, cold load 31.4 s, and 57 ms / 49.4 ms / 143 tok/s (TTFT / step / 8-way aggregate). The full run and method are in `benchmarks/gemma4-31b-tp2-l20.md`.
+The 8192 x 8 row was served with a 2.50 GiB global pool, 14.18 GiB free after weights and a 31.4 s cold load. Its historical 57 ms / 49.4 ms / 143 tok/s reading (TTFT / step / 8-way aggregate) used the former staged TP path, before the stale-token fix. The full run and method are in `benchmarks/gemma4-31b-tp2-l20.md`.
 
 ## What is refused under TP today
 
@@ -102,11 +102,11 @@ Two environment constraints are baked into the code. The **kernels must be warm 
 
 Parity is the same gate, with `PEGAINFER_TP_GRAPH=1`: two ranks captured against one rank eager, `48/48` picks and worst gap `0.0000` on the 31B-geometry checkpoint. The server starts, serves and shuts down cleanly with `--tp-size=2 --cuda-graph=true`.
 
-Captured against eager is a wash on two L20s at 31B (8192 x 8), back to back on a quiet box: first token 57.0 vs 56.5 ms, decode step 51.5 vs 49.4 ms (+4%), 8-way aggregate 146.0 vs 143.7 tok/s. The collective, not launch count, dominates the step here, so graphs buy little; the flag is on by default (as at TP1) and `--cuda-graph=false` is the marginally faster per-step choice at low concurrency.
+The historical captured/eager comparison on two L20s at 31B (8192 x 8) read 57.0/56.5 ms first token, 51.5/49.4 ms decode step and 146.0/143.7 tok/s at eight concurrent requests. Those runs used the former staged TP path; they do not establish the graph tradeoff for the current collect-before-launch path. Graphs remain enabled by default.
 
 ## Verification
 
-`engine::lane_gates_tp::the_two_rank_engine_matches_one_rank` starts a real engine twice — once with one rank, once with two — over the same 12B checkpoint, three prompts and one batch, and compares the requested top-8 logprobs.
+`engine::lane_gates_tp::the_two_rank_engine_matches_one_rank` runs one rank twice and two ranks once over the same 12B checkpoint, three prompts and one batch, and compares the requested top-8 logprobs. The concurrent requests are admitted as one cohort in each run so host scheduling cannot change the compared batch shapes.
 
 It holds the *distributions*, not the greedy tokens: a two-rank reduction sums the same products in a different order and NCCL writes bf16 back, so the logits differ in their last bits and a near-tie can flip the pick. The gate prints the build and the device pair it ran on (`tp2: NCCL 2.18.3, devices 1,2`), because a reading is only comparable with the environment it came from — but nothing here claims *why* two readings from different environments differ. The line comes from this gate's own readings, one procedure, one head (`45eb4a68`, four runs of the 12B on two L20s, `NCCL_PROTO=LL128`):
 

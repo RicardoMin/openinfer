@@ -53,10 +53,12 @@ fn the_raise_refuses_without_its_prerequisites() {
 }
 
 fn lane_lifecycle_script(mode: &str) {
+    let slots = std::env::var(super::DECODE_SLOTS_ENV)
+        .unwrap_or_else(|_| super::MAX_CONCURRENCY.to_string());
     let mut harness = launch(&[
         (super::ASYNC_PREFILL_ENV, mode),
         (super::PREFIX_CACHE_ENV, "4"),
-        (super::DECODE_SLOTS_ENV, "4"),
+        (super::DECODE_SLOTS_ENV, &slots),
     ]);
     let streamer = pin_live_stream(&mut harness);
 

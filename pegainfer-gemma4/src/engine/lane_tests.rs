@@ -10,6 +10,7 @@ use pegainfer_frontend::engine::LiveScheduler;
 use pegainfer_frontend::engine::Request;
 use pegainfer_frontend::engine::RequestControl;
 use pegainfer_frontend::engine::RequestId;
+use pegainfer_frontend::engine::Scheduler;
 use pegainfer_frontend::engine::SchedulerMetrics;
 use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::engine::spawn_scheduler;
@@ -34,15 +35,19 @@ impl Harness {
         }
     }
 
-    pub(super) fn from_state(state: super::EngineState) -> Self {
-        let servable_len = Some(u32::try_from(state.max_context).expect("servable ceiling"));
-        let mut scheduler = spawn_scheduler("gemma4-test", super::Gemma4Scheduler::new(state));
+    pub(super) fn from_scheduler(scheduler: impl Scheduler + 'static, max_context: usize) -> Self {
+        let mut scheduler = spawn_scheduler("gemma4-test", scheduler);
         let steps = scheduler.handle.take_steps().expect("fresh step stream");
         Self {
             scheduler: Some(scheduler),
             steps: StepCollector::new(steps),
-            servable_len,
+            servable_len: Some(u32::try_from(max_context).expect("servable ceiling")),
         }
+    }
+
+    pub(super) fn from_state(state: super::EngineState) -> Self {
+        let max_context = state.max_context;
+        Self::from_scheduler(super::Gemma4Scheduler::new(state), max_context)
     }
 
     pub(super) fn submit(&self, prompt_tokens: Vec<u32>, max_tokens: usize) -> RequestControl {
@@ -81,10 +86,7 @@ impl Harness {
             .handle
             .submit(Request {
                 prompt_tokens,
-                params: pegainfer_frontend::sampler::SamplingParams {
-                    ignore_eos: true,
-                    ..pegainfer_frontend::sampler::SamplingParams::default()
-                },
+                params: pegainfer_frontend::sampler::SamplingParams::default(),
                 history_tokens: None,
                 stop_policy,
                 max_tokens,

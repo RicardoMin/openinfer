@@ -60,12 +60,62 @@ fn stop_policy_drains_decode_before_reusing_its_slot() {
         let next = harness.steps.drain(next.id(), "slot reused after a stop");
         assert_eq!((next.tokens, next.finish), (6, FinishReason::Length));
         assert_eq!(next.stop_cause, None);
+        assert_eq!(next.ids, reference.ids[..6]);
         assert!(
             wait_until(Duration::from_secs(10), || harness.metrics() == idle),
             "the stopped row and its staged successor release their pages: idle {idle:?}, now {:?}",
             harness.metrics()
         );
     }
+    let dir = crate::testkit::model_path();
+    let mut model_eos = super::generation_policy(&dir)
+        .expect("generation policy")
+        .eos;
+    model_eos.sort_unstable();
+    assert_eq!(model_eos, [1, 50, 106]);
+    // The pinned 12B tokenizer's primary EOS is 1; the frontend lowers
+    // its other generation EOS IDs into explicit stops.
+    let primary = 1;
+    let policy = StopPolicy::new(EosPolicy::Token(primary), vec![50, 106]);
+    // "Reply with exactly one word: OK." rendered with the checkpoint's
+    // chat template (thinking disabled) and encoded by the frontend tokenizer.
+    let prompt = vec![
+        2, 105, 2364, 107, 40_654, 607, 7121, 886, 3658, 236_787, 16_119, 236_761, 106, 107, 105,
+        4368, 107, 100, 45_518, 107, 101,
+    ];
+    let stopped = harness.submit_with_policy(prompt.clone(), 128, Some(8), None, policy);
+    let stopped = harness.steps.drain(stopped.id(), "natural EOS");
+    assert_eq!(stopped.finish, FinishReason::Stop);
+    let position = stopped
+        .ids
+        .iter()
+        .position(|id| model_eos.contains(id))
+        .expect("the response includes its EOS trigger");
+    assert_eq!(position + 1, stopped.tokens);
+    let trigger = stopped.ids[position];
+    assert_eq!(
+        stopped.stop_cause,
+        Some(if trigger == primary {
+            StopCause::Eos(trigger)
+        } else {
+            StopCause::Token(trigger)
+        })
+    );
+    super::lane_gates_tp::assert_finite(
+        stopped.logprobs[position]
+            .as_ref()
+            .expect("the EOS is scored"),
+        "natural EOS",
+    );
+    let ignored = harness.submit_scored(prompt, stopped.tokens + 2, Some(8), None);
+    let ignored = harness.steps.drain(ignored.id(), "ignored EOS");
+    assert_eq!(
+        (ignored.tokens, ignored.finish),
+        (stopped.tokens + 2, FinishReason::Length)
+    );
+    assert_eq!(ignored.stop_cause, None);
+    assert_eq!(stopped.ids, ignored.ids[..stopped.tokens]);
+    assert_eq!(stopped.logprobs, ignored.logprobs[..stopped.tokens]);
     harness.shutdown(&[]);
 }
 
