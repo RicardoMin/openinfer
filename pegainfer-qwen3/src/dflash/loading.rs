@@ -1,5 +1,6 @@
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::ensure;
 use log::debug;
 use pegainfer_core::rope::RopeTableSpec;
 use pegainfer_core::rope::precompute_rope;
@@ -9,8 +10,11 @@ use pegainfer_core::weight_loader::StagedWeightLoader;
 use pegainfer_core::weight_loader::deserialize_shards;
 use pegainfer_core::weight_loader::load_shard_info;
 use pegainfer_core::weight_loader::load_tensor_1d;
+use pegainfer_core::weight_loader::load_tensor_1d_stitch;
 use pegainfer_core::weight_loader::load_tensor_2d;
 use pegainfer_core::weight_loader::mmap_shards;
+use safetensors::Dtype;
+use safetensors::tensor::TensorView;
 
 use super::DFlashDraftModel;
 use super::conv::GroupedConv;
@@ -160,18 +164,29 @@ impl DFlashDraftModel {
             for layer in 0..config.num_hidden_layers {
                 let mut load = |name: &str| -> Result<_> {
                     let prefix = format!("layers.{layer}.{name}");
+                    let base_name = format!("{prefix}.base_kernel");
+                    let base = match weight_map.get(&base_name) {
+                        Some(&index) => shards[index].tensor(&base_name)?,
+                        None => shards
+                            .iter()
+                            .find_map(|shard| shard.tensor(&base_name).ok())
+                            .with_context(|| {
+                                format!("Tensor '{base_name}' not found in any shard")
+                            })?,
+                    };
+                    validate_conv_base(&base, &base_name, conv.taps, config.hidden_size)?;
                     Ok((
                         loader.matrix(
                             &format!("{prefix}.kernel_projection.weight"),
                             width,
                             config.hidden_size,
                         )?,
-                        // The kernel views the flat buffer as [2, taps, hidden].
-                        load_tensor_1d(
+                        load_tensor_1d_stitch(
                             ctx,
                             &shards,
                             &weight_map,
-                            &format!("{prefix}.base_kernel"),
+                            &base_name,
+                            &[(0, base.data().len() / std::mem::size_of::<half::bf16>())],
                         )?,
                     ))
                 };
@@ -303,5 +318,53 @@ impl DFlashDraftModel {
             markov,
             selector,
         })
+    }
+}
+
+fn validate_conv_base(
+    tensor: &TensorView<'_>,
+    name: &str,
+    taps: usize,
+    hidden: usize,
+) -> Result<()> {
+    ensure!(
+        tensor.dtype() == Dtype::BF16,
+        "Tensor '{name}': expected dtype BF16, got {:?}",
+        tensor.dtype()
+    );
+    ensure!(
+        tensor.shape() == [2, taps, hidden],
+        "Tensor '{name}' has shape {:?}, expected [2, {taps}, {hidden}]",
+        tensor.shape()
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conv_base_requires_bf16_and_exact_native_shape() -> Result<()> {
+        let name = "layers.0.attention_conv.base_kernel";
+        for (dtype, shape, expected_error) in [
+            (Dtype::BF16, vec![2, 2, 4], None),
+            (Dtype::F16, vec![2, 2, 4], Some("expected dtype BF16")),
+            (Dtype::BF16, vec![2, 4, 2], Some("expected [2, 2, 4]")),
+            (Dtype::BF16, vec![2, 2, 3], Some("expected [2, 2, 4]")),
+        ] {
+            let bytes = vec![0; shape.iter().product::<usize>() * 2];
+            let tensor = TensorView::new(dtype, shape, &bytes)?;
+            let result = validate_conv_base(&tensor, name, 2, 4);
+            if let Some(expected) = expected_error {
+                let error = result
+                    .expect_err("invalid convolution base accepted")
+                    .to_string();
+                assert!(error.contains(name) && error.contains(expected), "{error}");
+            } else {
+                result?;
+            }
+        }
+        Ok(())
     }
 }
