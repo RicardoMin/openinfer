@@ -62,8 +62,8 @@ impl Inputs {
 
     fn poison_inactive(&mut self, active: usize) {
         for request in 0..N {
-            // The discarded anchor slot is poisoned even for active
-            // requests. It must never become a candidate or a gated hidden row.
+            // TopK reads active anchor rows, but their poisoned values must
+            // never enter the candidate lattice or a gated hidden row.
             let row = request * BLOCK;
             self.logits[row * VOCAB..(row + 1) * VOCAB].fill(bf16::NAN);
             self.hidden[row * RANK..(row + 1) * RANK].fill(bf16::NAN);
@@ -92,7 +92,7 @@ fn oracle(input: &Inputs, active: usize, candidates: &[u32]) -> Oracle {
         for position in 0..LENGTH {
             let row = request * BLOCK + 1 + position;
             let logits = &input.logits[row * VOCAB..(row + 1) * VOCAB];
-            let start = (request * LENGTH + position) * K;
+            let start = row * K;
             let ids: Vec<_> = candidates[start..start + K]
                 .iter()
                 .map(|&id| id as usize)
@@ -118,7 +118,12 @@ fn oracle(input: &Inputs, active: usize, candidates: &[u32]) -> Oracle {
             let scores = &output.edges
                 [edge_start + previous_index * K..edge_start + (previous_index + 1) * K];
             previous_index = (0..K)
-                .min_by(|&a, &b| scores[b].total_cmp(&scores[a]).then(ids[a].cmp(&ids[b])))
+                .min_by(|&a, &b| {
+                    scores[b]
+                        .partial_cmp(&scores[a])
+                        .unwrap()
+                        .then(ids[a].cmp(&ids[b]))
+                })
                 .unwrap();
             output.path.push(ids[previous_index] as u32);
             previous_ids = ids.iter().map(|&id| id as u32).collect();
@@ -149,13 +154,13 @@ fn verify(
     let edges = ctx.stream.clone_dtoh(scratch.edge_scores())?;
     let path = ctx.stream.clone_dtoh(scratch.selected_ids())?;
 
-    for (row, ids) in candidates[..active * LENGTH * K]
+    for (source, ids) in candidates[..active * BLOCK * K]
         .as_chunks::<K>()
         .0
         .iter()
         .enumerate()
+        .filter(|(source, _)| source % BLOCK != 0)
     {
-        let source = (row / LENGTH) * BLOCK + 1 + row % LENGTH;
         let logits = &input.logits[source * VOCAB..(source + 1) * VOCAB];
         let mut ranked: Vec<_> = (0..VOCAB as u32).collect();
         let order = |&left: &u32, &right: &u32| {
@@ -168,17 +173,23 @@ fn verify(
         ranked.select_nth_unstable_by(K - 1, order);
         ranked.truncate(K);
         ranked.sort_by(order);
-        if exact_candidates {
-            assert_eq!(ids.as_slice(), ranked.as_slice());
-        }
         let mut unique = ids.to_vec();
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), K);
-        for (&id, &expected_id) in ids.iter().zip(&ranked) {
+        for &id in ids {
             assert!((id as usize) < VOCAB);
+        }
+        // Candidate order is irrelevant to the lattice. Sort only a CPU copy
+        // for the top-16 set check; the scalar oracle uses the GPU's order.
+        let mut actual = ids.to_vec();
+        actual.sort_by(order);
+        if exact_candidates {
+            assert_eq!(actual, ranked);
+        }
+        for (&id, &expected_id) in actual.iter().zip(&ranked) {
             // Require every ranked top-16 value, allowing any equal-valued
-            // member at the cutoff. Sorting 16 outputs alone cannot fix ties.
+            // member at the cutoff, including either sign of zero.
             assert_eq!(logits[id as usize], logits[expected_id as usize]);
         }
     }
@@ -203,10 +214,11 @@ fn verify(
     for _ in 0..3 {
         graph.launch()?;
         assert_eq!(ctx.stream.clone_dtoh(scratch.error_flag())?, [0]);
-        assert_eq!(
-            &ctx.stream.clone_dtoh(scratch.candidate_ids())?[..active * LENGTH * K],
-            &candidates[..active * LENGTH * K]
-        );
+        let replayed = ctx.stream.clone_dtoh(scratch.candidate_ids())?;
+        for request in 0..active {
+            let rows = (request * BLOCK + 1) * K..(request + 1) * BLOCK * K;
+            assert_eq!(replayed[rows.clone()], candidates[rows]);
+        }
         assert_eq!(
             &ctx.stream.clone_dtoh(scratch.selected_ids())?[..expected.path.len()],
             expected.path
@@ -248,7 +260,7 @@ fn candidates_lattice_graph_replay_and_request_isolation() -> Result<()> {
 }
 
 #[test]
-fn invalid_inputs_never_publish_and_next_call_recovers() -> Result<()> {
+fn invalid_candidates_and_scores_never_publish_and_next_call_recovers() -> Result<()> {
     let ctx = DeviceContext::new()?;
     let mut scratch = DFlash2Scratch::new(&ctx, N, BLOCK, VOCAB, RANK)?;
     for case in 0..5 {
@@ -256,6 +268,8 @@ fn invalid_inputs_never_publish_and_next_call_recovers() -> Result<()> {
         input.poison_inactive(1);
         let expected_flag = match case {
             0 => {
+                // A positive NaN is selected by radix ordering. Unselected
+                // logits are outside the finite-value check's contract.
                 input.logits[VOCAB] = bf16::NAN;
                 1
             }

@@ -8,12 +8,7 @@ Last touched: 2026-10
 
 Every speculative method is the same transaction; only *propose* differs.
 
-The DFlash lane uses independent argmax for plain DFlash, the Markov head for
-DSpark, and learned top-16 pair scoring for DFlash2. Supported native Speculators
-DFlash2 checkpoints use their own embedding and LM head, plus block-local convolutions
-and an anchor-based attention window. These change proposal generation; target
-verification and acceptance follow the same transaction below. The performance
-measurements in this document are from the original DFlash checkpoints.
+The DFlash lane uses independent argmax for plain DFlash, the Markov head for DSpark, and learned top-16 pair scoring for DFlash2. Native Speculators DFlash2 adds block-local convolutions and an anchor-based attention window. The supported `mgoin/Qwen3-4B-speculator.dflash2` checkpoint shares its embedding and LM head with the matching Qwen3-4B target, so those duplicate checkpoint tensors are not loaded. These change proposal generation; target verification and acceptance follow the same transaction below. The performance measurements in this document are from the original DFlash checkpoints.
 
 1. **Propose** — a method-specific drafter emits K candidate tokens.
 2. **Verify** — the target model runs ONE prefill-style forward over the K+1 span `[current_token, draft_1, …, draft_K]` and reports its argmax at every position (echo=true).
@@ -123,9 +118,7 @@ DFlash's draft model and its per-request KV/scratch live **outside** the paged K
 - **Per-token, pool-scaling** (draft KV + the prompt-tracking context scratch + the in-fill tail scratch + pending context, **65 536 B/token**) → folded into `effective_bytes_per_block`, so the *target* block count shrinks while the pool itself stays allocated at the target-only `bytes_per_block`. This is a safe upper bound: the scheduler reserves pool blocks for each request's whole lifetime (`prompt + max_tokens`), and the draft attends at most that many tokens, so billing the draft per pool-token over-covers. The draft KV and tail scratch are sized one in-fill block past that lifetime, so the fixed term also reserves `max_decode_batch × block_size` of that per-request headroom.
 - **Fixed, pool-independent** (draft weights ~1.1 GiB + the block-sized per-request scratch across the decode batch — logits-dominated, ~6.5 MiB × 256) → added to the KV `margin`.
 
-The figures above describe the original b16 checkpoint. Native DFlash2 also
-reserves its embedding, LM head, convolutions, selector weights and scratch in
-the fixed term.
+The figures above describe the original b16 checkpoint. Native DFlash2 additionally reserves convolution and selector weights and scratch in the fixed term. The shared embedding and LM head are already accounted for by the target and are not reserved again.
 
 Measured on the RTX 5070 Ti (16 GB, util 90%), the pool correctly makes room for the draft:
 

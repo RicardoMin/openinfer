@@ -1020,7 +1020,7 @@ unsafe extern "C" {
 }
 
 // Native DFlash2 candidate selection. All entries guard C++ exceptions;
-// nonfinite device inputs are reported separately through the error flag.
+// nonfinite selected candidates and computed scores use the error flag.
 unsafe extern "C" {
     pub fn dflash2_prepare_cuda(
         logits: *const Half,
@@ -1033,7 +1033,6 @@ unsafe extern "C" {
         gated: *mut f32,
         successors: *mut f32,
         error: *mut u32,
-        compact: *mut Half,
         topk_values: *mut Half,
         row_states: *mut u8,
         batch: i32,

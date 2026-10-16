@@ -54,7 +54,7 @@ impl SelectorHead {
             weights,
             sizing::product(&[batch, config.block_size, rank, 6])?,
             sizing::product(&[batch, 4])?,
-            DFlash2Scratch::reservation_bytes(batch, config.block_size, config.vocab_size, rank)?,
+            DFlash2Scratch::reservation_bytes(batch, config.block_size, rank)?,
         ])
     }
 

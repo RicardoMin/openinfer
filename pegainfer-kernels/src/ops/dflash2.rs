@@ -20,21 +20,22 @@ use crate::tensor::has_stream_override;
 
 pub const DFLASH2_CANDIDATE_K: usize = 16;
 
-/// Fixed-capacity, stream-local scratch. Non-anchor logits are compacted into
-/// BF16 rows for one batched FlashInfer radix selection. Tied boundary membership
+/// Fixed-capacity, stream-local scratch. FlashInfer selects directly from all
+/// input rows; the lattice ignores each anchor row. Tied boundary membership
 /// is repeatable on a fixed input and system, without a smallest-token-ID rule.
 /// All allocation occurs in `new`, outside capture.
 ///
-/// The output accessors expose capacity-sized buffers. Only `active_batch *
-/// (block_size - 1)` rows belong to the latest selection. Invalid inputs poison
-/// the active path with `u32::MAX`; reject that path before submitting tokens
-/// and read `error_flag()` for details.
+/// The output accessors expose capacity-sized buffers. Candidate IDs retain
+/// `active_batch * block_size` rows; unary scores, edges and selected IDs have
+/// `active_batch * (block_size - 1)` rows. Invalid candidate values or computed
+/// scores poison the active path with `u32::MAX`; reject that path before
+/// submitting tokens and read `error_flag()` for details. Logits outside the
+/// selected candidates are not checked for finiteness.
 pub struct DFlash2Scratch {
     max_batch: usize,
     block_size: usize,
     vocab: usize,
     rank: usize,
-    compact_logits: CudaSlice<bf16>,
     topk_values: CudaSlice<bf16>,
     row_states: CudaSlice<u8>,
 
@@ -57,19 +58,14 @@ fn product(values: &[usize]) -> Result<usize> {
 }
 
 impl DFlash2Scratch {
-    pub fn reservation_bytes(
-        batch: usize,
-        block: usize,
-        vocab: usize,
-        rank: usize,
-    ) -> Result<usize> {
+    pub fn reservation_bytes(batch: usize, block: usize, rank: usize) -> Result<usize> {
         ensure!(block >= 2, "DFlash2 block must contain a draft position");
         let rows = product(&[batch, block - 1])?;
         let sizes = [
-            product(&[rows, vocab, 2])?,
-            product(&[rows, DFLASH2_CANDIDATE_K, 2])?,
+            // BF16 values + u32 IDs, including anchor rows.
+            product(&[batch, block, DFLASH2_CANDIDATE_K, 6])?,
             flashinfer_top1_row_states_bytes(),
-            product(&[rows, DFLASH2_CANDIDATE_K, 8])?,
+            product(&[rows, DFLASH2_CANDIDATE_K, 4])?,
             product(&[rows, DFLASH2_CANDIDATE_K, rank, 8])?,
             product(&[rows, DFLASH2_CANDIDATE_K, DFLASH2_CANDIDATE_K, 4])?,
             product(&[rows, 4])?,
@@ -112,7 +108,7 @@ impl DFlash2Scratch {
         );
 
         let rows = product(&[max_batch, block_size - 1])?;
-        let compact_elements = product(&[rows, vocab])?;
+        let topk_elements = product(&[input_rows, DFLASH2_CANDIDATE_K])?;
         let candidates = product(&[rows, DFLASH2_CANDIDATE_K])?;
         let gathered = product(&[candidates, rank])?;
         let edges = product(&[candidates, DFLASH2_CANDIDATE_K])?;
@@ -124,10 +120,9 @@ impl DFlash2Scratch {
             block_size,
             vocab,
             rank,
-            compact_logits: ctx.stream.alloc_zeros(compact_elements)?,
-            topk_values: ctx.stream.alloc_zeros(candidates)?,
+            topk_values: ctx.stream.alloc_zeros(topk_elements)?,
             row_states: ctx.stream.alloc_zeros(flashinfer_top1_row_states_bytes())?,
-            candidate_ids: ctx.stream.alloc_zeros(candidates)?,
+            candidate_ids: ctx.stream.alloc_zeros(topk_elements)?,
             unary_scores: ctx.stream.alloc_zeros(candidates)?,
             gated_predecessors: ctx.stream.alloc_zeros(gathered)?,
             successors: ctx.stream.alloc_zeros(gathered)?,
@@ -137,6 +132,7 @@ impl DFlash2Scratch {
         })
     }
 
+    /// Unordered `[request, block_position, candidate]`, including unused anchors.
     pub fn candidate_ids(&self) -> &CudaSlice<u32> {
         &self.candidate_ids
     }
@@ -154,7 +150,7 @@ impl DFlash2Scratch {
         &self.selected_ids
     }
 
-    /// Bit mask: 1 = NaN/+Inf unary, 2 = fewer than 16 finite candidates,
+    /// Bit mask: 1 = selected NaN/+Inf unary, 2 = selected -Inf unary,
     /// 4 = invalid token ID, 8 = nonfinite gate/edge. Zero means valid.
     pub fn error_flag(&self) -> &CudaSlice<u32> {
         &self.error_flag
@@ -254,7 +250,6 @@ pub fn dflash2_select_into(
         let (gated_ptr, _gg) = scratch.gated_predecessors.device_ptr_mut(&ctx.stream);
         let (successors_ptr, _gss) = scratch.successors.device_ptr_mut(&ctx.stream);
         let (error_ptr, _ge) = scratch.error_flag.device_ptr_mut(&ctx.stream);
-        let (compact_ptr, _gc) = scratch.compact_logits.device_ptr_mut(&ctx.stream);
         let (topk_values_ptr, _gt) = scratch.topk_values.device_ptr_mut(&ctx.stream);
         let (row_states_ptr, _gr) = scratch.row_states.device_ptr_mut(&ctx.stream);
 
@@ -270,7 +265,6 @@ pub fn dflash2_select_into(
                 gated_ptr as *mut f32,
                 successors_ptr as *mut f32,
                 error_ptr as *mut u32,
-                compact_ptr as *mut ffi::Half,
                 topk_values_ptr as *mut ffi::Half,
                 row_states_ptr as *mut u8,
                 active_batch as i32,

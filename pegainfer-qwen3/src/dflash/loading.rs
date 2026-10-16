@@ -157,7 +157,7 @@ impl DFlashDraftModel {
             });
         }
 
-        let (convs, embed_tokens, lm_head) = if let Some(conv) = &config.conv {
+        let convs = if let Some(conv) = &config.conv {
             let mut loader = StagedWeightLoader::new(ctx, &shards, &weight_map)?;
             let width = 2 * conv.taps * (config.hidden_size / conv.group_size);
             let mut kernels = Vec::with_capacity(config.num_hidden_layers);
@@ -193,11 +193,6 @@ impl DFlashDraftModel {
                 kernels.push((load("attention_conv")?, load("mlp_conv")?));
             }
 
-            // The supported Speculators checkpoints carry untied embedding and
-            // output-head weights; reusing the target's would change the model.
-            let embed =
-                loader.matrix("embed_tokens.weight", config.vocab_size, config.hidden_size)?;
-            let head = loader.matrix("lm_head.weight", config.vocab_size, config.hidden_size)?;
             loader.finish()?;
 
             let mut take = |(projection, base)| GroupedConv {
@@ -213,15 +208,13 @@ impl DFlashDraftModel {
                     mlp: take(mlp),
                 })
                 .collect();
-            (
-                Some(layers),
-                Some(loader.take(embed)),
-                Some(loader.take(head)),
-            )
+            Some(layers)
         } else {
-            (None, None, None)
+            None
         };
 
+        // Embeddings and the LM head are shared with the target, including the
+        // byte-identical copies in the supported native Qwen3-4B checkpoint.
         let norm = load_tensor_1d(ctx, &shards, &weight_map, "norm.weight")?;
         let hidden_norm = load_tensor_1d(ctx, &shards, &weight_map, "hidden_norm.weight")?;
         let fc = load_tensor_2d(
@@ -233,9 +226,7 @@ impl DFlashDraftModel {
             hidden * config.target_layer_ids.len(),
         )?;
 
-        // DSpark Markov head (Phase 1). The confidence head and the tied
-        // embed_tokens/lm_head are intentionally skipped: the head is byte-identical
-        // to the target's, which we reuse for the verify-equivalent logits.
+        // DSpark Markov head (Phase 1). The confidence head is intentionally skipped.
         let markov = if config.uses_markov_head() {
             let w1 = load_tensor_2d(
                 ctx,
@@ -308,8 +299,6 @@ impl DFlashDraftModel {
             config,
             layers,
             convs,
-            embed_tokens,
-            lm_head,
             norm,
             hidden_norm,
             fc,

@@ -1,7 +1,6 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <math_constants.h>
-#include <cub/block/block_radix_sort.cuh>
 #include <flashinfer/sampling.cuh>
 #include <flashinfer/topk.cuh>
 
@@ -29,65 +28,18 @@ int blocks(int64_t elements) {
   return static_cast<int>(std::min<int64_t>((elements + 255) / 256, 65535));
 }
 
-// Sort the selected candidates by score, then token ID. Membership at a tied
-// top-16 boundary follows FlashInfer's deterministic radix selection.
-__device__ uint64_t score_key(float score, unsigned token) {
-  if (score == 0.0f) {
-    score = 0.0f;
-  }
-
-  const unsigned bits = __float_as_uint(score);
-  const unsigned ordered = bits ^ ((bits >> 31) ? 0xffffffffu : 0x80000000u);
-  return (static_cast<uint64_t>(ordered) << 32) | (0xffffffffu - token);
-}
-
-__device__ float key_score(uint64_t key) {
-  const unsigned ordered = static_cast<unsigned>(key >> 32);
-  return __uint_as_float(ordered ^ ((ordered >> 31) ? 0x80000000u : 0xffffffffu));
-}
-
-__global__ void compact_logits(const __nv_bfloat16* logits, __nv_bfloat16* compact,
-                              int vocab, int block_size, int rows, unsigned* error) {
-  const int64_t count = static_cast<int64_t>(rows) * vocab;
-
-  for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-       index < count; index += static_cast<int64_t>(gridDim.x) * blockDim.x) {
-    const int64_t row = index / vocab;
-    const unsigned token = index % vocab;
-    const int request = row / (block_size - 1);
-    const int position = row % (block_size - 1);
-    const int64_t source = static_cast<int64_t>(request) * block_size + 1 + position;
-    float score = __bfloat162float(logits[source * vocab + token]);
-    if (isnan(score) || score == CUDART_INF_F) {
-      atomicOr(error, kInvalidLogit);
-      score = -CUDART_INF_F;
-    } else if (score == 0.0f) {
-      score = 0.0f;
-    }
-    compact[index] = __float2bfloat16_rn(score);
-  }
-}
-
-// RadixTopK returns an unordered set. Sort just those 16 candidates, not the
-// whole vocabulary. Zero padding sorts below every encoded key, including -Inf.
-__global__ void unpack_candidates(const __nv_bfloat16* values, unsigned* ids,
-                                 float* unary, unsigned* error) {
-  using Sort = cub::BlockRadixSort<uint64_t, 32, 1>;
-  __shared__ typename Sort::TempStorage storage;
-
+// TopK keeps the input row layout. Drop anchor rows only when unpacking the
+// small candidate set; walk resolves score ties without sorting candidates.
+__global__ void unpack_candidates(const __nv_bfloat16* values, float* unary,
+                                 int block_size, unsigned* error) {
   const int64_t row = blockIdx.x;
-  const int64_t output = row * kCandidates + threadIdx.x;
-  uint64_t key[1] = {
-      threadIdx.x < kCandidates
-          ? score_key(__bfloat162float(values[output]), ids[output])
-          : 0};
-  Sort(storage).SortDescending(key);
+  const int64_t source = (row / (block_size - 1)) * block_size + 1 + row % (block_size - 1);
 
   if (threadIdx.x < kCandidates) {
-    ids[output] = 0xffffffffu - static_cast<unsigned>(key[0]);
-    unary[output] = key_score(key[0]);
-    if (!isfinite(unary[output])) {
-      atomicOr(error, kInsufficientCandidates);
+    const float score = __bfloat162float(values[source * kCandidates + threadIdx.x]);
+    unary[row * kCandidates + threadIdx.x] = score;
+    if (!isfinite(score)) {
+      atomicOr(error, score == -CUDART_INF_F ? kInsufficientCandidates : kInvalidLogit);
     }
   }
 }
@@ -108,11 +60,12 @@ __global__ void gather_gated_codebooks(
     const int row = index / (static_cast<int64_t>(rank) * kCandidates);
     const int request = row / (block_size - 1);
     const int position = row % (block_size - 1);
+    const int64_t source = static_cast<int64_t>(request) * block_size + 1 + position;
     const unsigned prev =
         position == 0
             ? anchors[request]
-            : ids[static_cast<int64_t>(row - 1) * kCandidates + candidate];
-    const unsigned next = ids[static_cast<int64_t>(row) * kCandidates + candidate];
+            : ids[(source - 1) * kCandidates + candidate];
+    const unsigned next = ids[source * kCandidates + candidate];
 
     if (prev >= static_cast<unsigned>(vocab) || next >= static_cast<unsigned>(vocab)) {
       atomicOr(error, kInvalidToken);
@@ -121,7 +74,6 @@ __global__ void gather_gated_codebooks(
       continue;
     }
 
-    const int64_t source = static_cast<int64_t>(request) * block_size + 1 + position;
     const float h = __bfloat162float(hidden[source * rank + component]);
     const float a = __bfloat162float(predecessor[static_cast<int64_t>(prev) * rank + component]);
     const float b = __bfloat162float(successor[static_cast<int64_t>(next) * rank + component]);
@@ -163,7 +115,8 @@ __global__ void walk(const float* edges, const unsigned* ids, unsigned* selected
       }
 
       const float* scores = edges + (row * kCandidates + predecessor) * kCandidates;
-      const unsigned* candidates = ids + row * kCandidates;
+      const int64_t source = static_cast<int64_t>(request) * (length + 1) + 1 + position;
+      const unsigned* candidates = ids + source * kCandidates;
       int best = 0;
       for (int candidate = 1; candidate < kCandidates; ++candidate) {
         if (scores[candidate] > scores[best] ||
@@ -185,24 +138,20 @@ extern "C" int dflash2_prepare_cuda(
     const __nv_bfloat16* logits, const __nv_bfloat16* hidden,
     const __nv_bfloat16* predecessor, const __nv_bfloat16* successor,
     const unsigned* anchors, unsigned* ids, float* unary, float* gated,
-    float* successors, unsigned* error, __nv_bfloat16* compact,
-    __nv_bfloat16* topk_values, uint8_t* row_states, int batch, int block_size,
-    int vocab, int rank, cudaStream_t stream) {
+    float* successors, unsigned* error, __nv_bfloat16* topk_values,
+    uint8_t* row_states, int batch, int block_size, int vocab, int rank,
+    cudaStream_t stream) {
   PEGAINFER_FFI_GUARD_BEGIN
   check_cuda(cudaMemsetAsync(error, 0, sizeof(unsigned), stream));
   const int rows = batch * (block_size - 1);
 
-  compact_logits<<<blocks(static_cast<int64_t>(rows) * vocab), 256, 0, stream>>>(
-      logits, compact, vocab, block_size, rows, error);
-  check_cuda(cudaPeekAtLastError());
-
   check_cuda(flashinfer::sampling::RadixTopKMultiCTA<__nv_bfloat16, int32_t>(
-      compact, reinterpret_cast<int32_t*>(ids), topk_values, nullptr,
-      rows, kCandidates, vocab,
+      const_cast<__nv_bfloat16*>(logits), reinterpret_cast<int32_t*>(ids), topk_values, nullptr,
+      batch * block_size, kCandidates, vocab,
       reinterpret_cast<flashinfer::sampling::RadixRowState*>(row_states),
       /*deterministic=*/true, stream));
 
-  unpack_candidates<<<rows, 32, 0, stream>>>(topk_values, ids, unary, error);
+  unpack_candidates<<<rows, 32, 0, stream>>>(topk_values, unary, block_size, error);
   check_cuda(cudaPeekAtLastError());
 
   gather_gated_codebooks<<<blocks(static_cast<int64_t>(rows) * kCandidates * rank), 256, 0, stream>>>(

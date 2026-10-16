@@ -28,8 +28,6 @@ pub(crate) struct DFlashDraftModel {
     config: DFlashConfig,
     layers: Vec<TransformerBlock>,
     convs: Option<Vec<LayerConvs>>,
-    embed_tokens: Option<DeviceMatrix>,
-    lm_head: Option<DeviceMatrix>,
     norm: DeviceVec,
     hidden_norm: DeviceVec,
     fc: DeviceMatrix,
@@ -590,11 +588,7 @@ impl DFlashDraftModel {
             &scratch.block_token_ids_h[..batch_block_rows],
             &mut token_ids_dst,
         )?;
-        if let Some(embedding) = &self.embed_tokens {
-            ops::embedding_batch(ctx, embedding, &scratch.token_ids_d, &mut scratch.hidden)?;
-        } else {
-            target.get_embeddings_batch_into(&scratch.token_ids_d, &mut scratch.hidden)?;
-        }
+        target.get_embeddings_batch_into(&scratch.token_ids_d, &mut scratch.hidden)?;
 
         // Per-request context projection: varlen (each request's committed
         // prefix differs), persisted in the request so every layer can read it.
@@ -983,9 +977,7 @@ impl DFlashDraftModel {
         );
         ops::gemm_into(
             ctx,
-            self.lm_head
-                .as_ref()
-                .unwrap_or_else(|| target.output_projection()),
+            target.output_projection(),
             &scratch.logits_normed,
             &mut scratch.logits,
         );

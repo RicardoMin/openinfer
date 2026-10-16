@@ -127,14 +127,13 @@ impl DFlashMemoryReservation {
                 hidden,
                 sizing::sum(&[2 * conv.taps, dynamic_width])?,
             ])?;
-            let embeddings = sizing::product(&[2, config.vocab_size, hidden, BF16])?;
             let conv_scratch = sizing::product(&[
                 max_decode_batch_size,
                 config.block_size,
                 BF16,
                 sizing::sum(&[hidden, dynamic_width])?,
             ])?;
-            sizing::sum(&[conv_weights, embeddings, conv_scratch])?
+            sizing::sum(&[conv_weights, conv_scratch])?
         } else {
             0
         };
