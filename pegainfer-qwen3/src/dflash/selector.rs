@@ -166,7 +166,7 @@ impl SelectorScratch {
                     ctx,
                     batch,
                     config.block_size,
-                    config.vocab_size,
+                    config.logits_rows,
                     config.selector_rank,
                 )?,
             },

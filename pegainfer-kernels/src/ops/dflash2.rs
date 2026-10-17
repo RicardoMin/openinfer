@@ -170,6 +170,7 @@ fn check_stream<T>(ctx: &DeviceContext, buffer: &CudaSlice<T>, name: &str) -> Re
 /// hidden states and BF16 codebooks. No allocation, host transfer or sync occurs
 /// here. Warm up shared cuBLAS before graph capture, as for existing GEMM ops.
 ///
+/// Codebooks may retain checkpoint rows beyond the target logits width.
 /// Buffers must use the same base stream: DeviceContext disables cudarc's event
 /// tracking, so a stream override would leave buffer ownership unsynchronized.
 /// An empty batch is a no-op; its caller must not collect stale scratch outputs.
@@ -217,10 +218,10 @@ pub fn dflash2_select_into(
     let codebook_elements = product(&[scratch.vocab, scratch.rank])?;
     for (name, matrix) in [("predecessor", predecessor), ("successor", successor)] {
         ensure!(
-            matrix.rows == scratch.vocab
+            matrix.rows >= scratch.vocab
                 && matrix.cols == scratch.rank
                 && matrix.data.len() >= codebook_elements,
-            "DFlash2 {name} expected [{}, {}] with sufficient backing, got [{}, {}], len={}",
+            "DFlash2 {name} expected at least {} rows and {} columns with sufficient backing, got [{}, {}], len={}",
             scratch.vocab,
             scratch.rank,
             matrix.rows,

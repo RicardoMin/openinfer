@@ -9,26 +9,28 @@ fn projection_and_graph_replay_match_scalar_selection() -> Result<()> {
     let config = serde_json::json!({
         "hidden_size": 4, "intermediate_size": 8, "num_hidden_layers": 1,
         "num_attention_heads": 1, "num_key_value_heads": 1, "num_target_layers": 1,
-        "head_dim": 4, "vocab_size": 16, "rms_norm_eps": 1e-6,
+        "head_dim": 4, "vocab_size": 32, "rms_norm_eps": 1e-6,
         "rope_theta": 10000.0, "block_size": 3, "mask_token_id": 0,
         "target_layer_ids": [0], "selector_rank": 2
     });
     std::fs::write(directory.path().join("config.json"), config.to_string())?;
-    let config = DFlashConfig::from_file(directory.path().to_str().unwrap())?;
+    let mut config = DFlashConfig::from_file(directory.path().to_str().unwrap())?;
+    // Target logits can be narrower than the checkpoint codebooks.
+    config.logits_rows = 16;
 
     let projection_weights: Vec<_> = (0..8)
         .map(|i| bf16::from_f32((i as f32 - 3.0) / 8.0))
         .collect();
-    let predecessor: Vec<_> = (0..32)
+    let predecessor: Vec<_> = (0..64)
         .map(|i| bf16::from_f32(((i % 7) as f32 - 3.0) / 8.0))
         .collect();
-    let successor: Vec<_> = (0..32)
+    let successor: Vec<_> = (0..64)
         .map(|i| bf16::from_f32(((i % 11) as f32 - 5.0) / 8.0))
         .collect();
     let head = SelectorHead {
         projection: DeviceMatrix::from_host(&ctx, &projection_weights, 2, 4)?,
-        predecessor: DeviceMatrix::from_host(&ctx, &predecessor, 16, 2)?,
-        successor: DeviceMatrix::from_host(&ctx, &successor, 16, 2)?,
+        predecessor: DeviceMatrix::from_host(&ctx, &predecessor, 32, 2)?,
+        successor: DeviceMatrix::from_host(&ctx, &successor, 32, 2)?,
     };
     let mut scratch = SelectorScratch::new(&ctx, &config, 2)?;
     let mut hidden = HiddenStates::zeros(&ctx, 4, 6)?;

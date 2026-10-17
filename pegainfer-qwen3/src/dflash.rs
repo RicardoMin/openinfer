@@ -812,7 +812,7 @@ impl DFlashDraftModel {
         for (i, state) in states.iter_mut().enumerate() {
             state.committed_len += context_lens[i];
         }
-        self.compute_logits_into(target, scratch);
+        self.compute_logits_into(target, scratch)?;
         Ok(&scratch.logits)
     }
 
@@ -966,7 +966,11 @@ impl DFlashDraftModel {
         );
     }
 
-    fn compute_logits_into(&self, target: &Qwen3Model, scratch: &mut DFlashBatchScratch) {
+    fn compute_logits_into(
+        &self,
+        target: &Qwen3Model,
+        scratch: &mut DFlashBatchScratch,
+    ) -> Result<()> {
         let ctx = target.device_ctx();
         ops::rms_norm_batch_into(
             ctx,
@@ -975,12 +979,7 @@ impl DFlashDraftModel {
             self.config.rms_norm_eps,
             &mut scratch.logits_normed,
         );
-        ops::gemm_into(
-            ctx,
-            target.output_projection(),
-            &scratch.logits_normed,
-            &mut scratch.logits,
-        );
+        target.project_logits(ctx, &scratch.logits_normed, &mut scratch.logits)
     }
 }
 
