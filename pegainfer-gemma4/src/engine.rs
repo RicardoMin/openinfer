@@ -2881,7 +2881,7 @@ impl EngineState {
                     .decode_batch_step_resident(&self.ctx, &mut self.arena, &mut kvs)
                     .map(|_| ())
             };
-            stepped.context("batched decode launch")?;
+            stepped?;
         }
         let graph_slot = crate::serve::decode_bucket_slot(rows);
         if let Some(graph) = self.sampler_graphs.get_mut(graph_slot) {

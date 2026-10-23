@@ -527,38 +527,58 @@ fn the_two_rank_engine_decodes_the_same_tokens_without_logprobs() {
     let (device, peer) = devices();
     assert_ne!(device, peer, "TP2 needs two distinct device ordinals");
     let mut harness = launch_with(&tp2_options(device, peer), &as_refs(&envelope_overrides()));
-    let prompt = ids(20, 11);
-    let scored_control = harness.submit_scored(prompt.clone(), 16, Some(0), None);
-    let scored = harness.steps.drain(scored_control.id(), "scored decode");
-    let unscored_control = harness.submit(prompt, 16);
-    let unscored = harness
-        .steps
-        .drain(unscored_control.id(), "unscored decode");
-    harness.shutdown(&[&scored_control, &unscored_control]);
+    let mut runs = Vec::new();
+    for (case, prompt) in crate::testkit::generate_fixture_prompts()
+        .into_iter()
+        .enumerate()
+    {
+        let scored_control = harness.submit_scored(prompt.clone(), 16, Some(0), None);
+        let scored = harness
+            .steps
+            .drain(scored_control.id(), &format!("case {case}: scored decode"));
+        let unscored_control = harness.submit(prompt, 16);
+        let unscored = harness.steps.drain(
+            unscored_control.id(),
+            &format!("case {case}: unscored decode"),
+        );
 
-    for (name, run) in [("scored", &scored), ("unscored", &unscored)] {
-        assert_eq!(run.ids.len(), 16, "{name}: complete token sequence");
-        assert_eq!(run.finish, FinishReason::Length, "{name}: finish reason");
+        runs.push((scored, unscored));
+    }
+    harness.shutdown(&[]);
+
+    for (case, (scored, unscored)) in runs.into_iter().enumerate() {
+        for (name, run) in [("scored", &scored), ("unscored", &unscored)] {
+            assert_eq!(
+                run.ids.len(),
+                16,
+                "case {case}, {name}: complete token sequence"
+            );
+            assert_eq!(
+                run.finish,
+                FinishReason::Length,
+                "case {case}, {name}: finish reason"
+            );
+            assert_eq!(
+                run.logprobs.len(),
+                16,
+                "case {case}, {name}: one logprob entry per token"
+            );
+        }
+        for lp in &scored.logprobs {
+            assert_finite(
+                lp.as_ref().expect("every scored token has a logprob"),
+                &format!("case {case}: scored decode"),
+            );
+        }
+        assert!(
+            unscored.logprobs.iter().all(Option::is_none),
+            "case {case}: unscored tokens must not carry logprobs"
+        );
         assert_eq!(
-            run.logprobs.len(),
-            16,
-            "{name}: one logprob entry per token"
+            unscored.ids, scored.ids,
+            "case {case}: TP decode must consume the latest sampled token with or without logprobs"
         );
     }
-    for lp in &scored.logprobs {
-        assert_finite(
-            lp.as_ref().expect("every scored token has a logprob"),
-            "scored decode",
-        );
-    }
-    assert!(
-        unscored.logprobs.iter().all(Option::is_none),
-        "unscored tokens must not carry logprobs"
-    );
-    assert_eq!(
-        unscored.ids, scored.ids,
-        "TP decode must consume the latest sampled token with or without logprobs"
-    );
 }
 
 /// The serving knobs a gate may force from the environment, so the same gate
